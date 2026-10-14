@@ -2517,6 +2517,34 @@ def test_container_to_sandbox_returns_extensions(mock_docker):
     assert sandbox.metadata is None
 
 
+@patch("opensandbox_server.services.docker.docker_service.docker")
+def test_container_to_sandbox_keeps_docker_times_with_trimmed_fraction(mock_docker):
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+    mock_docker.from_env.return_value = mock_client
+
+    service = DockerSandboxService(config=_app_config())
+    container = MagicMock()
+    container.attrs = {
+        "Config": {"Labels": {SANDBOX_ID_LABEL: "sandbox-frac"}, "Cmd": ["python"]},
+        "Created": "2025-01-01T00:00:00.12345Z",
+        "State": {
+            "Status": "exited",
+            "Running": False,
+            "FinishedAt": "2025-01-01T00:05:00.5Z",
+            "ExitCode": 0,
+        },
+    }
+    container.image = MagicMock(tags=["python:3.11"], short_id="sha-img")
+
+    sandbox = service._container_to_sandbox(container)
+
+    assert sandbox.created_at == datetime(2025, 1, 1, 0, 0, 0, 123450, tzinfo=timezone.utc)
+    assert sandbox.status.last_transition_at == datetime(
+        2025, 1, 1, 0, 5, 0, 500000, tzinfo=timezone.utc
+    )
+
+
 @pytest.mark.asyncio
 @patch("opensandbox_server.services.docker.docker_service.docker")
 async def test_create_sandbox_response_includes_extensions(mock_docker):
