@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import posixpath
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from docker.errors import DockerException, NotFound as DockerNotFound
 from fastapi import HTTPException, status
@@ -40,17 +40,58 @@ from opensandbox_server.services.validators import (
     ensure_volumes_valid,
 )
 
+if TYPE_CHECKING:
+    from opensandbox_server.api.schema import CreateSandboxRequest
+
 logger = logging.getLogger(__name__)
 
 
 class DockerVolumesMixin:
     """Mixin providing volume validation, bind mount building, and cleanup."""
 
+    def _validate_volume_definitions(self, request: CreateSandboxRequest) -> None:
+        """Validate request volumes before filesystem changes or Docker API calls."""
+        if not request.volumes:
+            return
+
+        allowed_prefixes = self.app_config.storage.allowed_host_paths
+        ensure_volumes_valid(request.volumes, allowed_host_prefixes=allowed_prefixes)
+
+        seen_mount_paths: set[str] = set()
+        for volume in request.volumes:
+            # Docker cleans container paths, including repeated leading slashes.
+            mount_path = posixpath.normpath("/" + volume.mount_path.lstrip("/"))
+            if mount_path == "/":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_MOUNT_PATH,
+                        "message": (
+                            f"Volume '{volume.name}': mount path '{volume.mount_path}' "
+                            "resolves to '/', which is not supported by the Docker runtime."
+                        ),
+                    },
+                )
+            if mount_path in seen_mount_paths:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_MOUNT_PATH,
+                        "message": (
+                            f"Duplicate mount path '{mount_path}'. Each volume must have "
+                            "a unique mount destination in the Docker runtime."
+                        ),
+                    },
+                )
+            seen_mount_paths.add(mount_path)
+
     def _validate_volumes(
         self, request
     ) -> tuple[dict[str, dict], list[str]]:
         """
-        Validate volume definitions for Docker runtime.
+        Validate volume backends for Docker runtime.
+
+        Request definitions must already have passed ``_validate_volume_definitions``.
 
         Returns:
             A tuple of:
@@ -69,8 +110,6 @@ class DockerVolumesMixin:
             return {}, []
 
         allowed_prefixes = self.app_config.storage.allowed_host_paths
-        ensure_volumes_valid(request.volumes, allowed_host_prefixes=allowed_prefixes)
-
         pvc_inspect_cache: dict[str, dict] = {}
         auto_created_volumes: list[str] = []
         try:
