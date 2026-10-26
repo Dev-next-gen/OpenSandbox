@@ -4060,6 +4060,8 @@ class TestDockerVolumeValidation:
             ("other", "//", SandboxErrorCodes.INVALID_MOUNT_PATH),
             ("other", "/.", SandboxErrorCodes.INVALID_MOUNT_PATH),
             ("other", "/mnt/..", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/\\", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/mnt/..\\", SandboxErrorCodes.INVALID_MOUNT_PATH),
         ],
     )
     @pytest.mark.asyncio
@@ -4113,7 +4115,8 @@ class TestDockerVolumeValidation:
         assert mock_client.mock_calls == []
 
     @pytest.mark.parametrize(
-        "mount_path", ["/mnt/data/cache", "/mnt/other", "/tmp/opensandbox-execd"]
+        "mount_path",
+        ["/mnt/data/cache", "/mnt/other", "/tmp/opensandbox-execd", "/mnt\\data", "/mnt/data\\"],
     )
     @pytest.mark.asyncio
     async def test_nested_and_repeated_source_mounts_allowed(self, mock_docker, mount_path):

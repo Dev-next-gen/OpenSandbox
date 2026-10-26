@@ -61,7 +61,9 @@ class DockerVolumesMixin:
         for volume in request.volumes:
             # Docker cleans container paths, including repeated leading slashes.
             mount_path = posixpath.normpath("/" + volume.mount_path.lstrip("/"))
-            if mount_path == "/":
+            # Docker's root check also reads a backslash as "/"; its duplicate check does not.
+            root_path = posixpath.normpath("/" + volume.mount_path.replace("\\", "/").lstrip("/"))
+            if root_path == "/":
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail={
