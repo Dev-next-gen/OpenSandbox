@@ -95,14 +95,13 @@ class _UnixConnection(http.client.HTTPConnection):
 
 
 class _ResolverProcess:
-    """Run one resolver server instance in a background thread.
+    """Run one resolver server in a background thread.
 
-    Every response carries ``Connection: close`` (mirroring the revision IPC
-    discipline: one request per connection), so clients must open a fresh
-    connection per request; reusing one trips over the server-side close.
-    Handler-side exceptions are recorded on the server instead of being
-    swallowed and are asserted here unless they belong to the expected
-    client-abort class (``allow_client_aborts``, e.g. the delay test).
+    Responses are ``Connection: close`` (one request per connection), so
+    open a fresh connection per request. Handler exceptions are recorded on
+    the server and asserted here; ``allow_client_aborts`` tolerates
+    BrokenPipe/ConnectionReset records (the delay test disconnects
+    mid-handler by design).
     """
 
     CLIENT_ABORT_ERRORS = ("BrokenPipeError", "ConnectionResetError")
@@ -198,8 +197,7 @@ class ResolverUDSTest(unittest.TestCase):
             },
             document,
         )
-        # D15: the subject asserted by the signature stub is the egress
-        # sandboxId, mirrored verbatim into x-test-subject.
+        # D15: x-test-subject mirrors the egress sandboxId verbatim.
         self.assertEqual(
             VALID_REQUEST["subject"], document["headers"]["x-test-subject"]
         )
@@ -218,9 +216,7 @@ class ResolverUDSTest(unittest.TestCase):
         )
 
     def test_fixed_service_path_rejects_other_paths_with_404(self) -> None:
-        # One fresh connection per request: the resolver replies with
-        # ``Connection: close`` and closes the socket, so reusing a
-        # connection across requests races the server-side close.
+        # One fresh connection per request: every response closes the socket.
         with _ResolverProcess(build_uds_server(self.socket_path)):
             for path in ("/", "/resolve/", "/v1/resolve"):
                 status, _ = self.post(dumps(VALID_REQUEST), path=path)
@@ -433,9 +429,8 @@ class ResolverFaultInjectionTest(unittest.TestCase):
 
     def test_delay_exceeds_client_timeout(self) -> None:
         server = build_uds_server(self.socket_path, ["--delay", "1000"])
-        # The client aborts at 0.2s while the handler is still sleeping, so
-        # the handler's eventual write raises a client-abort error that the
-        # harness tolerates; anything else still fails the test.
+        # The client aborts mid-handler; the harness tolerates the resulting
+        # client-abort records only.
         with _ResolverProcess(server, allow_client_aborts=True):
             started = time.monotonic()
             with self.assertRaises((TimeoutError, OSError)):

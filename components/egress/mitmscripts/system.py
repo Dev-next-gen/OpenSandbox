@@ -119,10 +119,8 @@ ACTIVE_VAULT_HEADER_RESERVED_NAMES = {
 _ACTIVE_VAULT_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
 _ACTIVE_VAULT_HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
-# Strict snapshot key sets (OSEP-0025 version-skew gate). The addon rejects
-# any snapshot carrying fields outside these sets instead of silently
-# dropping them, so a newer egress must never degrade to an empty static
-# binding on an older addon.
+# Strict snapshot key sets: unknown fields reject the whole snapshot
+# (OSEP-0025 version-skew gate) instead of silently degrading bindings.
 _ACTIVE_VAULT_TOP_LEVEL_FIELDS = {"revision", "bindings", "redactions"}
 _ACTIVE_VAULT_BINDING_FIELDS = {
     "name",
@@ -131,8 +129,8 @@ _ACTIVE_VAULT_BINDING_FIELDS = {
     "substitutions",
     "exchange",
 }
-# `ports` is deprecated upstream (accepted but ignored) and still rendered by
-# the Go snapshot for legacy vaults; it stays allowed and ignored here.
+# `ports` is deprecated upstream but still rendered by the Go snapshot for
+# legacy vaults; allowed and ignored here.
 _ACTIVE_VAULT_MATCH_FIELDS = {"schemes", "ports", "hosts", "methods", "paths"}
 _ACTIVE_VAULT_HEADER_FIELDS = {"name", "value"}
 _ACTIVE_VAULT_SUBSTITUTION_FIELDS = {"placeholder", "value", "in"}
@@ -865,13 +863,9 @@ def _parse_active_vault(payload: Any) -> ActiveVault:
 
 
 def _parse_active_vault_exchange(binding: dict[str, Any], index: int) -> dict[str, str] | None:
-    """Validate the optional exchange marker of one snapshot binding.
-
-    Exchange bindings carry no rendered material: ``headers`` and
-    ``substitutions`` must be explicitly present and empty, and the marker
-    itself must be exactly ``{"credential": <non-empty name>}``. Anything
-    else fails the snapshot closed instead of silently degrading to a static
-    binding that would forward the request uncredentialed.
+    """Validate the optional exchange marker: exactly ``{"credential": name}``
+    with explicitly empty ``headers``/``substitutions``; anything else fails
+    the snapshot closed.
     """
     raw_exchange = binding.get("exchange")
     if raw_exchange is None:
@@ -1888,10 +1882,8 @@ def _apply_vault_binding(
     if not binding:
         return
 
-    # Exchange bindings resolve per request against the egress process; until
-    # that resolve path is wired in (OSEP-0025 T3b), a selected exchange
-    # binding must fail closed instead of forwarding the request without
-    # credentials.
+    # Until the T3b resolve path exists, exchange bindings must fail closed
+    # rather than forward uncredentialed.
     if "exchange" in binding:
         _reject_request(flow, b"credential exchange unavailable\n", status_code=503)
         ctx.log.warn(

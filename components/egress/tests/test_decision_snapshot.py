@@ -167,9 +167,8 @@ class DecisionSnapshotTest(unittest.TestCase):
             self.assert_rejected(candidate)
 
     def test_rejects_exchange_marker_from_newer_egress(self):
-        """Version-skew gate: this validator predates OSEP-0025 exchange
-        markers, so a snapshot emitted by a newer egress must fail closed
-        here instead of degrading to an empty static binding."""
+        """Version-skew gate: snapshots carrying OSEP-0025 exchange markers
+        must fail closed on this (unextended) validator."""
         candidate = self.active()
         candidate["fullRenderedBindings"][0]["exchange"] = {
             "credential": "spi-signer"

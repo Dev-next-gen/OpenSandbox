@@ -14,58 +14,29 @@
 
 """Standalone credential header-resolver stub for OSEP-0025 tests.
 
-Implements the egress-to-resolver contract: one POSTed JSON document
-(subject, credential, binding, destination, request) answered with a header
-map plus optional incremental redactions. It serves as the public reference
-peer for egress conformance tests, e2e smoke flows, and as a development
-stub that can run before the egress resolver client exists.
+Serves the egress-to-resolver contract (one POSTed JSON document answered
+with a header map plus optional incremental redactions) as the conformance
+peer for egress tests and a development stub that runs before the egress
+client exists.
 
-Framing (D15): the service is fixed at ``POST /resolve``; requests on any
-other path answer 404. UDS mode never inspects the Host header — the socket
-path selects the service — and HTTPS mode carries the origin in TLS SNI plus
-the Authorization header, so no virtual-host dispatch exists.
+Transports:
 
-The ``subject`` field is the egress-authoritative sandboxId (sidecar: the
-sandbox's configured ID; fast-sandbox: the clientIp-mapped subject); the
-deterministic signature stub exists so e2e tests can assert that egress sent
-the expected sandboxId and verified destination.
+- ``--uds PATH``: HTTP over a Unix domain socket (bound 0660); no caller
+  authentication — the socket permissions are the trust boundary.
+- ``--https HOST:PORT --tls-cert PEM --tls-key PEM``: TLS with Bearer caller
+  authentication; the token is ``--auth`` or is looked up by origin in
+  ``OPENSANDBOX_EGRESS_CREDENTIAL_RESOLVER_AUTH``. Without a configured
+  token every request is rejected with 401 (fail closed).
 
-Transports
-----------
+Framing (D15): fixed at ``POST /resolve``; other paths answer 404; UDS mode
+never inspects Host. ``subject`` is the egress-authoritative sandboxId, and
+``x-test-signature`` is the SHA-256 hex of
+``subject|credential|binding|authority|path`` so tests can assert both.
 
-``--uds PATH``
-    HTTP over a Unix domain socket. No caller authentication: the socket's
-    file permissions (the stub binds with 0660) are the trust boundary.
-
-``--https HOST:PORT --tls-cert PEM --tls-key PEM``
-    TLS with ``Authorization: Bearer <token>`` caller authentication. The
-    expected token is ``--auth`` or is looked up by this server's origin
-    (``https://HOST:PORT``) in ``OPENSANDBOX_EGRESS_CREDENTIAL_RESOLVER_AUTH``
-    (format ``origin=token,origin=token``). Without a configured token every
-    request is rejected with 401 (fail closed).
-
-Deterministic resolution
-------------------------
-
-Every response carries ``authorization: Bearer test-<credential>``,
-``x-test-subject: <subject>``, and ``x-test-signature`` — the SHA-256 hex
-digest of ``subject|credential|binding|authority|path`` — so e2e tests can
-assert that egress derived the right subject and verified destination.
-
-Fault injection
----------------
-
-``--delay MS``
-    Sleep before every response (resolver timeout tests).
-
-``--fail once|RATE``
-    ``once`` refuses the first resolution and serves afterwards; ``RATE`` in
-    ``[0,1]`` refuses that random fraction. Refusals answer ``503
-    resolution_refused`` so tests can pin egress fail-closed behavior.
-
-``--incomplete-redactions``
-    Return redactions for only the first header (OSEP-0025 R9: egress must
-    auto-derive the rest and never trust resolver redactions as authority).
+Fault injection: ``--delay MS`` sleeps before every response; ``--fail
+once|RATE`` answers ``503 resolution_refused``; ``--incomplete-redactions``
+returns redactions for only one header (egress must auto-derive the rest,
+R9).
 """
 
 from __future__ import annotations
@@ -89,9 +60,8 @@ import traceback
 from typing import Any
 
 MAX_REQUEST_BYTES = 64 * 1024
-# Bodies beyond the request cap are drained up to this bound before the 413
-# is written, so well-behaved clients finish sending instead of dying on a
-# broken pipe; anything larger may still be disconnected mid-upload.
+# Bodies over the cap are drained up to this bound before the 413, so
+# clients finish sending instead of dying on a broken pipe.
 MAX_DRAIN_BYTES = 1024 * 1024
 
 _REQUEST_FIELDS = {"subject", "credential", "binding", "destination", "request"}
@@ -130,12 +100,9 @@ def _string_map(value: Any) -> bool:
 
 
 def parse_resolve_request(payload: dict[str, Any]) -> dict[str, str]:
-    """Validate one resolver request and return its flat parts.
+    """Validate one resolver request (``subject`` is the egress sandboxId).
 
-    ``subject`` is the egress-authoritative sandboxId; ``destination`` is the
-    verified outbound destination. Raises ``_BadRequest`` for anything that
-    does not exactly match the OSEP-0025 resolver contract so shape drift
-    fails loudly in tests.
+    Raises ``_BadRequest`` for anything off the OSEP-0025 contract.
     """
     if set(payload) != _REQUEST_FIELDS:
         raise _BadRequest
@@ -239,16 +206,13 @@ class _UnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     address_family = socket.AF_UNIX
 
     def server_bind(self) -> None:
-        # HTTPServer.server_bind derives server_name/server_port from an
-        # AF_INET address tuple; a Unix socket path is already the identity.
+        # HTTPServer.server_bind expects an AF_INET address tuple.
         socketserver.TCPServer.server_bind(self)
         self.server_name = "resolver.uds"
         self.server_port = 0
 
     def handle_error(self, _request: object, _address: object) -> None:
-        # Record instead of swallow: tests assert this list stays empty, so
-        # handler bugs surface as server-side failures instead of mystery
-        # client errors such as BrokenPipeError on a socket we closed.
+        # Recorded, not swallowed: tests assert this stays empty.
         self.exceptions.append(traceback.format_exc())
 
 
