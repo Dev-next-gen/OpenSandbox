@@ -50,8 +50,7 @@ def check_aio_process(sbx: SandboxSync) -> bool:
                     elapsed = time.perf_counter() - start
                     print(f"[check] sandbox ready after {elapsed:.1f}s")
                     return True
-            except Exception as exc:
-                # print(f"[check] aio sandbox check health failed: {exc}")
+            except Exception:
                 pass
             time.sleep(0.2)
         return False

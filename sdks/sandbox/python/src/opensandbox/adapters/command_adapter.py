@@ -87,7 +87,6 @@ class CommandsAdapter(Commands):
     """
 
     RUN_COMMAND_PATH = "/command"
-    INTERRUPT_COMMAND_PATH = "/command/{execution_id}/interrupt"
     SESSION_PATH = "/session"
     RUN_IN_SESSION_PATH = "/session/{session_id}/run"
 

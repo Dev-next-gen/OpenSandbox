@@ -197,7 +197,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         self._lifecycle_locks_guard = Lock()
         self._lifecycle_locks: WeakValueDictionary[str, LockType] = WeakValueDictionary()
         self._execd_archive_lock = Lock()
-        self._bootstrap_script_lock = Lock()
         self._sandbox_expirations: Dict[str, datetime] = {}
         self._expiration_timers: Dict[str, Timer] = {}
         self._ossfs_mount_lock = Lock()
