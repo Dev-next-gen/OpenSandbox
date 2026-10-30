@@ -399,6 +399,42 @@ def test_create_projects_env_to_crd(service, crs):
     assert "envs" not in crs.created[-1]["spec"]
 
 
+@pytest.fixture
+def execd_init_service(repo, crs, monkeypatch):
+    monkeypatch.setattr(WorkloadInformer, "start", lambda self: None)
+    with patch.object(K8sClient, "_load_config"):
+        k8s = K8sClient(KubernetesRuntimeConfig())
+    crs.install(k8s)
+    config = _config()
+    config.runtime.execd_run_as_init = True
+    svc = FastSandboxTemplateService(config, repository=repo, k8s_client=k8s)
+    yield svc
+    svc.close()
+
+
+def test_create_injects_execd_init_env_when_enabled(execd_init_service, crs):
+    # A client-provided EXECD_INIT must not win over the server switch.
+    record = execd_init_service.create_template(
+        _create_request(env={"EXECD_INIT": "0", "LOG_LEVEL": "info"})
+    )
+    envs = {e["name"]: e["value"] for e in crs.created[-1]["spec"]["envs"]}
+    assert envs == {"EXECD_INIT": "1", "LOG_LEVEL": "info"}
+    # The stored row keeps the client env; injection is projection-only.
+    assert record.spec["env"] == {"EXECD_INIT": "0", "LOG_LEVEL": "info"}
+
+    execd_init_service.create_template(_create_request())
+    assert crs.created[-1]["spec"]["envs"] == [{"name": "EXECD_INIT", "value": "1"}]
+
+
+def test_create_does_not_inject_execd_init_by_default(service, crs):
+    service.create_template(_create_request(env={"LOG_LEVEL": "info"}))
+    envs = {e["name"]: e["value"] for e in crs.created[-1]["spec"]["envs"]}
+    assert envs == {"LOG_LEVEL": "info"}
+
+    service.create_template(_create_request())
+    assert "envs" not in crs.created[-1]["spec"]
+
+
 def test_create_rejects_invalid_env_names(service):
     from fastapi import HTTPException
 
