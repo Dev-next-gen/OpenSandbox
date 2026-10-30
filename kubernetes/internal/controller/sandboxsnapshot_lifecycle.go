@@ -882,9 +882,25 @@ func containersWithoutDigest(containers []sandboxv1alpha1.ContainerSnapshot) []s
 }
 
 func (r *SandboxSnapshotReconciler) getCommitJobResult(ctx context.Context, namespace, jobName string) (*commitJobResult, bool, error) {
+	result, found, err := findCommitJobResult(ctx, r.Client, namespace, jobName)
+	if err != nil || found {
+		return result, found, err
+	}
+	// The informer cache can lag behind the commit Job status: a Job is
+	// reported Succeeded only after its Pod reached a terminal state, but the
+	// Pod update may not have reached the cache yet. Reading the Pod from the
+	// API server keeps a cache miss from being mistaken for a lost result,
+	// which would be an unrecoverable pause failure.
+	if r.APIReader == nil {
+		return nil, false, nil
+	}
+	return findCommitJobResult(ctx, r.APIReader, namespace, jobName)
+}
+
+func findCommitJobResult(ctx context.Context, reader client.Reader, namespace, jobName string) (*commitJobResult, bool, error) {
 	for _, labelKey := range []string{"job-name", "batch.kubernetes.io/job-name"} {
 		podList := &corev1.PodList{}
-		if err := r.List(ctx, podList,
+		if err := reader.List(ctx, podList,
 			client.InNamespace(namespace),
 			client.MatchingLabels{labelKey: jobName},
 		); err != nil {
