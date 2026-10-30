@@ -3,7 +3,7 @@ title: Credential Vault Exchange and Delegated Header Resolution
 authors:
   - "@Pangjiping"
 creation-date: 2026-10-28
-last-updated: 2026-10-28
+last-updated: 2026-10-30
 status: draft
 ---
 
@@ -81,6 +81,7 @@ Second, sandboxes that need such identities today use ad-hoc mitm addons and per
 | R11 | The vault enforces only a resolution timeout; resolver-internal caching and refresh are invisible to the contract | Must Have |
 | R12 | Exchanged material is never persisted to disk; restart recovery requires only policy | Must Have |
 | R13 | Exchange binding hosts join the credential-bound TLS decrypt set (OSEP-0023) in both profiles | Should Have |
+| R14 | The egress enforces a bounded resolver response envelope — total response bytes, header count, per-value length, and redaction count — before decoding; exceedance is a per-request denial | Must Have |
 
 ## Proposal
 
@@ -93,6 +94,8 @@ Second, sandboxes that need such identities today use ad-hoc mitm addons and per
 5. **Per-request latency is bounded.** The vault applies a fixed resolution timeout; whether the resolver served a cached token or performed a fresh signature is invisible to the contract.
 6. **Version skew fails closed.** A runtime component that does not support exchange must reject a vault containing exchange bindings outright; a dynamic binding must never silently degrade into an empty static binding or a missing vault.
 7. **One slow resolver affects only its matched requests.** Resolution is per request with a bounded timeout; unrelated traffic through the same egress is never blocked waiting on a resolver.
+8. **Resolver output is bounded before decoding (R14).** The timeout alone is not a memory bound: a caller-operated resolver can answer immediately with an arbitrarily large body. The egress therefore enforces a response envelope budget — total response bytes, header count, per-value length, and redaction count — and treats exceedance as a per-request denial; a single subject cannot exhaust a shared egress through a resolver response.
+9. **Resolver reachability under sidecar default-deny is an operator constraint, not an egress behavior.** The egress does not install exceptions for its own resolver dials. In the sidecar profile under `dns+nft` default-deny, locally re-originated dials traverse the OUTPUT policy, so the operator must provision resolver reachability for the egress process only — for example via the existing operator-provisioned UID-scoped exclusion mechanism used for upstream proxies, or equivalent host-level rules. Fast Sandbox imposes no OUTPUT enforcement for local dials, so once reachability is provisioned, behavior is identical in both profiles (R7). Resolver hosts must never be opened to the sandbox itself (never via the sandbox NetworkPolicy), which would violate R4.
 
 ### Risks and Mitigations
 
@@ -102,6 +105,7 @@ Second, sandboxes that need such identities today use ad-hoc mitm addons and per
 | Client forges subject identity | Cross-subject credential use | Subject never accepted from the addon protocol; resolved from client IP with the existing authoritative mapping |
 | Exchanged values leak through reads or diagnostics | Credential exposure | Resolution output exists per request only; redacted by name and value; never persisted |
 | Resolver outage breaks exchange-bound traffic | Availability regression | Documented as fail-closed semantics; operators monitor resolver health; static bindings are unaffected |
+| Malicious or broken resolver returns oversized responses | Shared-egress memory exhaustion across subjects | The egress enforces a bounded response envelope and denies on exceedance (R14) |
 
 ## Design Details
 
@@ -172,7 +176,7 @@ Field semantics — the user-facing reading of the model:
 | `source.endpoint` | Where to exchange, per request. The URI scheme selects the transport: `unix://` is HTTP over a Unix socket, `https://` is TLS |
 | `match` | When to exchange: the hosts, paths, and methods that trigger resolution |
 | `auth.credential` (no `type`) | Which resolver to use when triggered; "when" and "where" are decoupled so one resolver can serve many bindings. No `type` field: the resolver produces the complete header set, so there is no render shape to declare |
-| binding `name` | Audit identifier surfaced in logs and metrics |
+| binding `name` | Audit identifier surfaced in audit logs only; never a metric dimension (tenant-provided names are unbounded) |
 
 In short: `match` declares which requests, `endpoint` declares where to exchange, and the credential name welds the two together.
 
@@ -257,7 +261,7 @@ flowchart TD
     OK -->|"yes"| I["inject returned headers<br/>+ per-request redactions"]
     I --> FWD(["✅ forward"])
     S --> FWD
-    OK -->|"no: error / timeout / revision mismatch"| F(["❌ fail closed:<br/>407 non-streamed · kill streamed"])
+    OK -->|"no: error / timeout / captured binding invalidated"| F(["❌ fail closed:<br/>407 non-streamed · kill streamed"])
     classDef ok fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
     classDef proc fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
     classDef err fill:#FFB6C1,stroke:#DC143C,stroke-width:2px,color:black
@@ -283,21 +287,23 @@ sequenceDiagram
     Up-->>Egr: response
     Egr-->>App: response (exchanged values redacted by name and value)
 
-    alt non-200 / timeout / revision mismatch
+    alt non-200 / timeout / captured binding invalidated
         Egr--xApp: non-streamed → 407 · streamed → kill (fail closed, never pass-through)
     end
 ```
 
-Failure semantics: non-200, timeout, or revision mismatch is a per-request denial. It never degrades to pass-through and never poisons subsequent requests. Every resolution is bound to its snapshot generation and subject: a result that arrives after its request was cancelled, its binding deleted, or its sandbox replaced is discarded and never injected, including for a successor that reuses the same revision number.
+Failure semantics: non-200 and timeout are per-request denials. Invalidation is scoped, not global. Each resolution is pinned to the opaque snapshot generation and subject under which it was captured, following the immutable-snapshot semantics of OSEP-0012 and OSEP-0023: an unrelated vault mutation — any patch that does not touch the captured binding — never denies an in-flight or already-completed resolution. A result is discarded and never injected when its captured binding is deleted or replaced, when the vault is deleted, or when its subject is replaced, including by a successor that reuses the same revision number. Denials never degrade to pass-through and never poison subsequent requests.
 
 ### Resolver Contract
 
 The same JSON-over-HTTP contract applies to both transports: HTTP over a Unix socket for `unix://`, plain HTTPS for `https://`. This is the only surface a resolver implements.
 
+HTTP framing: both transports issue `POST` with `Content-Type: application/json`. The request target is fixed at `/resolve`; an `https://` endpoint URI may carry a path prefix (for example `https://resolver.internal/egress`), in which case the request target is that prefix joined with `/resolve` and `Host` is the endpoint authority. For `unix://` endpoints the request target is `/resolve` and `Host` is the literal `localhost`, which resolvers ignore. This removes route ambiguity between independent egress and resolver implementations.
+
 ```jsonc
 // egress → resolver
 {
-  "subject": "sbx-…",          // authoritative, filled by egress; resolvers key identity on it
+  "subject": "s-<sandbox UID>", // authoritative, filled by egress; identical value in both profiles
   "credential": "spi-signer",
   "binding": "internal-api",
   "destination": {             // validated outbound destination, not the client-controlled Host
@@ -319,6 +325,8 @@ The same JSON-over-HTTP contract applies to both transports: HTTP over a Unix so
 
 The `destination` block reflects the validated outbound destination as verified by the egress (scheme, authority including port, and SNI), so a resolver can bind a proof to the connection identity and distinguish `http://host` from `https://host`. Header names in the response are validated before injection.
 
+**Subject identity.** The wire value is `s-<sandbox UID>` in both profiles, so a resolver operator provisions exactly one identity namespace. The sidecar egress derives it from the sandbox identity provisioned to the egress process; the fast-sandbox egress derives it from the authoritative client-IP→subject registry seeded from the same sandbox UID. The raw client IP is never forwarded, and no protocol surface accepts a client-declared subject (R6).
+
 Hard requirements on a resolver endpoint, none of which dictate an implementation:
 
 | Requirement | Rationale |
@@ -326,10 +334,11 @@ Hard requirements on a resolver endpoint, none of which dictate an implementatio
 | Reachable only by the egress process (socket permissions, or caller authentication for HTTPS) | trust boundary; prevents sandbox-side credential minting (R4) |
 | Concurrent-safe, read-only | the egress issues parallel resolves |
 | Responds within the vault resolution timeout | the vault fails closed beyond it |
+| Stays within the egress-enforced response envelope (bounded bytes, header count, per-value length, redaction count) | shared-process memory safety; one subject cannot exhaust the egress through a resolver response (R14) |
 | Per-request semantics | input includes request context; output differs per request |
 | Absent/unreachable = denial | no fallback to uncredentialed pass-through |
 
-Authentication material for `https://` resolvers is provisioned through operator configuration of the egress, never through the vault API and never into the sandbox.
+Authentication material for `https://` resolvers is provisioned through operator configuration of the egress — origin-scoped, so a token is only ever presented to the endpoint it was configured for — never through the vault API and never into the sandbox.
 
 ### Example Instantiations
 
@@ -343,7 +352,7 @@ A SPIFFE-compatible signing service behind a local socket is the first target de
 
 ### Observability
 
-Audit events gain fields, never values: `credential` (resolver name), `resolution` (`resolved | denied | timeout`), `target_host`, `subject`. Metrics use only closed outcome attributes (`resolution` outcome, latency buckets) — the credential name is tenant-provided and must never become a metric dimension, keeping time-series cardinality bounded per OSEP-0010; it lives in audit logs only.
+Audit events gain fields, never values: `credential` (resolver name), `resolution` (`resolved | denied | timeout`), `target_host`, `subject`. Metrics use only closed outcome attributes (`resolution` outcome, latency buckets) — credential and binding names are tenant-provided and must never become metric dimensions, keeping time-series cardinality bounded per OSEP-0010; they live in audit logs only.
 
 ### Relationship to Prior OSEPs
 
@@ -356,9 +365,12 @@ Audit events gain fields, never values: `credential` (resolver name), `resolutio
 
 - Static path regression: inline-only vaults behave byte-for-byte as before.
 - Exchange happy path with both transports (UDS and HTTPS): resolve → inject → upstream sees fresh headers.
-- Fail-closed matrix: resolver down, timeout, and revision mismatch each deny without pass-through.
-- Subject isolation: no protocol surface accepts a subject string; the resolver always receives the egress-derived subject.
+- Fail-closed matrix: resolver down, timeout, and captured-binding invalidation each deny without pass-through.
+- In-flight stability: an unrelated binding patch does not deny an admitted resolution; deleting or replacing the captured binding does.
+- Response bounds: oversized and over-count resolver responses are denied per request while sibling subjects and unrelated traffic are unaffected (R14).
+- Subject isolation: no protocol surface accepts a subject string; the resolver always receives the egress-derived subject, and the wire value `s-<sandbox UID>` is identical across profiles.
 - Resolver access control: a sandbox process cannot obtain credential material by calling the resolver directly.
+- Sidecar resolver reachability: with an operator-provisioned reachability exclusion, the egress-originated HTTPS resolver dial succeeds while a sandbox process dialing the same endpoint is denied.
 - Redaction: injected dynamic values are removed from response headers by name and value; logs contain no values.
 - Restart recovery: exchange bindings reactivate from persisted policy; no material on disk before or after.
 
@@ -394,9 +406,9 @@ Callers would run their own refresh loops and re-POST values. This reintroduces 
 
 ## Infrastructure Needed
 
-- Egress: `exchange` source type, typeless auth form, resolver proxy (UDS and HTTPS clients) — no new component or image.
+- Egress: `exchange` source type, typeless auth form, resolver proxy (UDS and HTTPS clients), and response envelope enforcement — no new component or image.
 - Lifecycle server and spec: extend the `Credential.source` schema (today fixed to inline) and the binding auth union (today requires `type`) for the fast-sandbox relay path, including sanitization, server-side merge, and regenerated SDKs.
-- Operator configuration surface for the resolution timeout.
+- Operator configuration surface for the resolution timeout, per-origin resolver caller authentication, and the egress-side exchange capability gate.
 - Documentation and one example per transport.
 
 No new required external service is introduced by this proposal.
@@ -405,10 +417,10 @@ No new required external service is introduced by this proposal.
 
 The proposal is additive and opt-in. Sandboxes that use only `inline` credentials are unaffected.
 
-1. Land the schema and resolver proxy behind the existing `[egress.credential_vault].enabled` gate.
+1. Land the schema and resolver proxy behind an explicit egress-side exchange gate: the egress accepts vaults containing exchange bindings only when its resolver operator configuration (resolution timeout; caller-authentication table for HTTPS endpoints) is provisioned, and rejects them outright otherwise (fail closed). The lifecycle server needs no separate gate — it relays the extended schema, which also covers the fast-sandbox profile, which does not consult `credentialProxy.enabled`.
 2. Extend the lifecycle server path (source/auth schema, sanitization, merge, regenerated SDKs) so exchange requests survive the fast-sandbox relay round-trip instead of failing server-side validation.
 3. Validate against a local UDS signing service.
 4. Migrate operator templates from bespoke per-sandbox signing addons to exchange credentials and retire those addons.
-5. Document operator guidance: narrow binding scopes and resolver health monitoring.
+5. Document operator guidance: narrow binding scopes, resolver health monitoring, and sidecar resolver reachability provisioning under default-deny (egress-process-only access; never exposed to the sandbox).
 
 Scope note: the first implementation targets the Fast Sandbox use case with one publicly testable resolver and explicitly rejects unsupported combinations (per the version-skew caveat above). Full OSEP-0023 integration depth, recovery/drain hardening, body signing, and soak/performance matrices are follow-up work and do not block this proposal.
