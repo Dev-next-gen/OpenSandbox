@@ -129,6 +129,7 @@ class PoolPerformanceTester:
                     self.results[name]["allocated_time"] = time.time() - start_polling
                     break
             except Exception:
+                # Keep polling through API/read failures until allocation succeeds or times out.
                 pass
             
             await asyncio.sleep(self.poll_interval)

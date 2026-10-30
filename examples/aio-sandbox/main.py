@@ -51,6 +51,7 @@ def check_aio_process(sbx: SandboxSync) -> bool:
                     print(f"[check] sandbox ready after {elapsed:.1f}s")
                     return True
             except Exception:
+                # The process may still be starting; retry quietly until polling times out.
                 pass
             time.sleep(0.2)
         return False
