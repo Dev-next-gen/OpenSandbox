@@ -119,6 +119,21 @@ ACTIVE_VAULT_HEADER_RESERVED_NAMES = {
 _ACTIVE_VAULT_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
 _ACTIVE_VAULT_HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+# Strict snapshot key sets: unknown fields reject the whole snapshot
+# (OSEP-0025 version-skew gate) instead of silently degrading bindings.
+_ACTIVE_VAULT_TOP_LEVEL_FIELDS = {"revision", "bindings", "redactions"}
+_ACTIVE_VAULT_BINDING_FIELDS = {
+    "name",
+    "match",
+    "headers",
+    "substitutions",
+    "exchange",
+}
+# `ports` is deprecated upstream but still rendered by the Go snapshot for
+# legacy vaults; allowed and ignored here.
+_ACTIVE_VAULT_MATCH_FIELDS = {"schemes", "ports", "hosts", "methods", "paths"}
+_ACTIVE_VAULT_HEADER_FIELDS = {"name", "value"}
+_ACTIVE_VAULT_SUBSTITUTION_FIELDS = {"placeholder", "value", "in"}
 _REVISION_RUNTIME_ERROR = "credential proxy: invalid revision runtime configuration"
 _REVISION_ENV = {
     "socket": "OPENSANDBOX_EGRESS_REVISION_IPC_SOCKET",
@@ -649,6 +664,12 @@ def _fetch_active_vault(
 def _parse_active_vault(payload: Any) -> ActiveVault:
     if not isinstance(payload, dict):
         raise ActiveVaultLookupError("active vault payload must be an object")
+    unexpected_fields = set(payload) - _ACTIVE_VAULT_TOP_LEVEL_FIELDS
+    if unexpected_fields:
+        raise ActiveVaultLookupError(
+            "active vault payload contains unsupported fields: "
+            + ",".join(sorted(unexpected_fields))
+        )
     revision = payload.get("revision")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
         raise ActiveVaultLookupError("active vault revision must be a positive integer")
@@ -664,16 +685,30 @@ def _parse_active_vault(payload: Any) -> ActiveVault:
     redaction_set = set(redactions)
     normalized_bindings: list[dict[str, Any]] = []
     for index, binding in enumerate(bindings):
+        unexpected_fields = set(binding) - _ACTIVE_VAULT_BINDING_FIELDS
+        if unexpected_fields:
+            raise ActiveVaultLookupError(
+                f"active vault binding {index} contains unsupported fields: "
+                + ",".join(sorted(unexpected_fields))
+            )
         name = binding.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ActiveVaultLookupError(
                 f"active vault binding {index} name must be a non-empty string"
             )
 
+        exchange = _parse_active_vault_exchange(binding, index)
+
         match = binding.get("match")
         if not isinstance(match, dict):
             raise ActiveVaultLookupError(
                 f"active vault binding {index} match must be an object"
+            )
+        unexpected_fields = set(match) - _ACTIVE_VAULT_MATCH_FIELDS
+        if unexpected_fields:
+            raise ActiveVaultLookupError(
+                f"active vault binding {index} match contains unsupported fields: "
+                + ",".join(sorted(unexpected_fields))
             )
         host_field = f"binding {index} match.hosts"
         hosts = [
@@ -709,6 +744,13 @@ def _parse_active_vault(payload: Any) -> ActiveVault:
             )
         normalized_headers: list[dict[str, str]] = []
         for header_index, header in enumerate(raw_headers):
+            unexpected_fields = set(header) - _ACTIVE_VAULT_HEADER_FIELDS
+            if unexpected_fields:
+                raise ActiveVaultLookupError(
+                    f"active vault binding {index} header {header_index} "
+                    "contains unsupported fields: "
+                    + ",".join(sorted(unexpected_fields))
+                )
             header_name = header.get("name")
             header_value = header.get("value")
             if not isinstance(header_name, str) or not header_name.strip():
@@ -750,6 +792,13 @@ def _parse_active_vault(payload: Any) -> ActiveVault:
             )
         normalized_substitutions: list[dict[str, Any]] = []
         for substitution_index, substitution in enumerate(raw_substitutions):
+            unexpected_fields = set(substitution) - _ACTIVE_VAULT_SUBSTITUTION_FIELDS
+            if unexpected_fields:
+                raise ActiveVaultLookupError(
+                    f"active vault binding {index} substitution {substitution_index} "
+                    "contains unsupported fields: "
+                    + ",".join(sorted(unexpected_fields))
+                )
             placeholder = substitution.get("placeholder")
             value = substitution.get("value")
             if not isinstance(placeholder, str) or not placeholder.strip():
@@ -792,24 +841,51 @@ def _parse_active_vault(payload: Any) -> ActiveVault:
                 {"placeholder": placeholder, "value": value, "in": surfaces}
             )
 
-        normalized_bindings.append(
-            {
-                "name": name.strip(),
-                "match": {
-                    "schemes": schemes,
-                    "hosts": hosts,
-                    "methods": methods,
-                    "paths": paths,
-                },
-                "headers": normalized_headers,
-                "substitutions": normalized_substitutions,
-            }
-        )
+        normalized_binding: dict[str, Any] = {
+            "name": name.strip(),
+            "match": {
+                "schemes": schemes,
+                "hosts": hosts,
+                "methods": methods,
+                "paths": paths,
+            },
+            "headers": normalized_headers,
+            "substitutions": normalized_substitutions,
+        }
+        if exchange is not None:
+            normalized_binding["exchange"] = exchange
+        normalized_bindings.append(normalized_binding)
     return ActiveVault(
         revision=revision,
         bindings=normalized_bindings,
         redactions=list(redactions),
     )
+
+
+def _parse_active_vault_exchange(binding: dict[str, Any], index: int) -> dict[str, str] | None:
+    """Validate the optional exchange marker: exactly ``{"credential": name}``
+    with explicitly empty ``headers``/``substitutions``; any present value
+    (including ``null``) other than that shape fails the snapshot closed.
+    """
+    if "exchange" not in binding:
+        return None
+    raw_exchange = binding["exchange"]
+    if not isinstance(raw_exchange, dict) or set(raw_exchange) != {"credential"}:
+        raise ActiveVaultLookupError(
+            f"active vault binding {index} exchange must contain only credential"
+        )
+    credential = raw_exchange["credential"]
+    if not isinstance(credential, str) or not credential.strip():
+        raise ActiveVaultLookupError(
+            f"active vault binding {index} exchange credential must be a non-empty string"
+        )
+    for field in ("headers", "substitutions"):
+        if binding.get(field) != []:
+            raise ActiveVaultLookupError(
+                f"active vault binding {index} with exchange must carry an "
+                f"empty {field} list"
+            )
+    return {"credential": credential}
 
 
 def _normalize_active_vault_strings(
@@ -1804,6 +1880,16 @@ def _apply_vault_binding(
     # for credential injection, because no secret is at risk.
     binding = _select_binding(flow, vault)
     if not binding:
+        return
+
+    # Until the T3b resolve path exists, exchange bindings must fail closed
+    # rather than forward uncredentialed.
+    if "exchange" in binding:
+        _reject_request(flow, b"credential exchange unavailable\n", status_code=503)
+        ctx.log.warn(
+            "credential proxy: exchange binding unavailable binding="
+            f"{binding.get('name')}"
+        )
         return
 
     # Reject ambiguous paths only for requests that would receive credentials:
