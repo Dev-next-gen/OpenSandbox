@@ -25,12 +25,16 @@
 # end: sandbox create via the opensandbox CLI, execd /ping through the signed
 # gateway route, delete, a pause/resume round trip, a snapshot ->
 # restore-from-snapshotId boot, the egress-held credential vault lifecycle
-# (OSEP-0022 FastPath relay), and the full MITM CA chain (OSEP-0022 trust
+# (OSEP-0022 FastPath relay), the full MITM CA chain (OSEP-0022 trust
 # anchor): a self-signed CA is provisioned as the versioned Secret, the
 # server bakes it into the golden image, the pool pins the keypair into
 # mitmdump, and a guest HTTPS request proves the template↔pool fingerprint
 # pinning plus per-subject credential injection against a CA-signed TLS echo
-# endpoint.
+# endpoint, and the execd-as-init in-guest process verify (OSEP-0018: the
+# server config carries runtime.execd_run_as_init, so the guest boots
+# bootstrap.sh into `execd --init`; the stage pins PID 1 = guest init,
+# execd --init as its child, the entrypoint supervised by execd, orphan
+# reparenting to the subreaper, and hardening.init_mode=subreaper).
 #
 # All Kubernetes resources come from the charts via `helm template` + plain
 # `kubectl apply` (no helm release state); the only env-owned manifests are
@@ -61,6 +65,10 @@
 #   SERVER_HOST_PORT / GATEWAY_HOST_PORT  host-side publishes (default 18080/18081)
 #   WARM_IMAGES=1        preheat pool warmImages (default: on-demand first-sandbox pull)
 #   SBX_IMAGE / EXECD    template build inputs   (default opensandbox/fsb-sandbox-golden:latest / opensandbox/execd:latest)
+#   EXECD_RUN_AS_INIT    OSEP-0018 execd-as-init (default true): the server
+#                    config sets runtime.execd_run_as_init so templates bake
+#                    EXECD_INIT=1; false restores the classic topology (the
+#                    init-mode verify stage fails by design)
 #   POOL_MIN / POOL_MAX  pool capacity           (default 2/2; auto 1/1 when KIND_SINGLE=1)
 #   MAX_SANDBOXES_PER_POD per-fastlet sandbox capacity (default 8)
 #   XFS_STATEROOT / XFS_SIZE  reflink StateRoot on/off and virtual size
@@ -131,6 +139,13 @@ RC_CONFIG_DIR="$WORK/rc-config"
 
 SBX_IMAGE="${SBX_IMAGE:-opensandbox/fsb-sandbox-golden:latest}"
 EXECD="${EXECD:-opensandbox/execd:latest}"
+# OSEP-0018 execd-as-init: the server config carries runtime.execd_run_as_init,
+# so every golden-image template bakes EXECD_INIT=1 and the guest boots
+# bootstrap.sh into `execd --init` (execd supervises the workload as a
+# subreaper under the fsb guest init; the init-mode verify stage pins the
+# in-guest process topology). Set EXECD_RUN_AS_INIT=false for the classic
+# background-and-wait topology (the init-mode verify stage will then fail).
+EXECD_RUN_AS_INIT="${EXECD_RUN_AS_INIT:-true}"
 # WARM_IMAGES=1 preheats pool warmImages (keyed by template id); the default
 # is the on-demand first-sandbox pull through DART.
 WARM_IMAGES="${WARM_IMAGES:-0}"
@@ -2341,7 +2356,8 @@ render_server_config() { # > $GEN_DIR/osb-server-config.toml
 	mkdir -p "$GEN_DIR"
 	awk -v api_key="$SERVER_API_KEY" \
 		-v fastpath="$FASTPATH_ENDPOINT" -v fsb_ns="$RESOURCE_NS" -v pool="$POOL_NAME" \
-		-v execd="$EXECD" -v oci_secret="$OCI_REGISTRY_SECRET" -v oci_stack="$OCI_STACK" \
+		-v execd="$EXECD" -v execd_init="$EXECD_RUN_AS_INIT" \
+		-v oci_secret="$OCI_REGISTRY_SECRET" -v oci_stack="$OCI_STACK" \
 		-v mitm_ca="$MITM_CA_SECRET" '
 		{ if ($0 == "# @OCI_PUBLISH_SECRET@") {
 		    # emitted in-place so the key stays inside [kubernetes].
@@ -2354,6 +2370,7 @@ render_server_config() { # > $GEN_DIR/osb-server-config.toml
 		  gsub(/@FSB_NAMESPACE@/, fsb_ns)
 		  gsub(/@POOL_NAME@/, pool)
 		  gsub(/@EXECD_IMAGE@/, execd)
+		  gsub(/@EXECD_RUN_AS_INIT@/, execd_init)
 		  gsub(/@MITM_CA_SECRET@/, mitm_ca)
 		  gsub(/@GATEWAY_ADDRESS@/, gateway)
 		  print }
@@ -2369,6 +2386,10 @@ level = "INFO"
 [runtime]
 type = "kubernetes"
 execd_image = "@EXECD_IMAGE@"
+# OSEP-0018: templates bake EXECD_INIT=1 so the guest boots bootstrap.sh into
+# `execd --init` (subreaper under the fsb guest init); pinned by the
+# init-mode verify stage.
+execd_run_as_init = @EXECD_RUN_AS_INIT@
 
 [kubernetes]
 # One block for CR reads + fsb settings; sandboxes live in the pool's
@@ -2803,6 +2824,116 @@ pause_resume_verify() {
 	osb_api sandbox kill "$VERIFY_ID" >/dev/null 2>&1 \
 		|| log "verify cleanup: kill failed; remove $VERIFY_ID manually"
 	wait_for "pause/resume sandbox deleted" 120 verify_sandbox_gone
+}
+
+# --- stage: execd-as-init in-guest process verify (OSEP-0018) -------------------
+# NOTE: verify/init-mode.sh carries the split-layout copy of this stage; keep
+# the two in sync until the env.sh split is completed and the verify scripts
+# become the single home.
+
+# guest_out <words...>: run a command in the sandbox through the CLI; stdout
+# is the guest command's output (framing lines tolerated downstream).
+guest_out() {
+	osb_api command run "$VERIFY_ID" -- "$@" 2>"$LOGS_DIR/init-mode-cmd.err"
+}
+
+# guest_value <key> <words...>: extract the VALUE of the guest's KEY=VALUE
+# line (first match wins; non-matching framing lines are skipped).
+guest_value() { # <key> <probe-words...>
+	local key="$1" line
+	shift
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		case "$line" in
+			"$key="*) printf '%s\n' "${line#*=}"; return 0 ;;
+		esac
+	done < <(guest_out "$@")
+	return 1
+}
+
+init_mode_verify() { # [template-id]
+	local template_id="${1:-$TEMPLATE_ID}"
+	local created execd_pid probe
+
+	log "verify (init-mode): creating a sandbox via the opensandbox CLI (templateId=$template_id)"
+	created="$(osb_api sandbox create --template "$template_id" --timeout 1h \
+		--metadata origin=fast-sandbox-env-init-mode -o json 2>/dev/null)" \
+		|| fail "osb sandbox create failed against $SERVER_URL"
+	VERIFY_ID="$(printf '%s' "$created" | jq -r '.id')"
+	[[ -n "$VERIFY_ID" && "$VERIFY_ID" != "null" ]] || fail "create response carried no id"
+	wait_for "init-mode target Running" 600 sandbox_running
+
+	# 0. The full in-guest process table, verbatim: the ground truth every
+	#    assertion below filters, and the first evidence a failure reads.
+	log "verify (init-mode): in-guest process table (pid ppid pgid sid stat args):"
+	guest_out sh -c 'ps -eo pid,ppid,pgid,sid,stat,args || ps -ef' \
+		| tee "$LOGS_DIR/init-mode-processes.txt" >&2 \
+		|| log "verify (init-mode): process table dump failed (continuing; the probes below carry the diagnostics)"
+
+	# 1. PID 1 is the fsb guest init (not bootstrap.sh, not execd).
+	probe="$(guest_value PID1 sh -c 'echo "PID1=$(tr "\0" " " < /proc/1/cmdline)"')" \
+		|| fail "init-mode: /proc/1/cmdline probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	case "$probe" in
+		*sandbox-init*) pass "guest PID 1 is the fsb guest init ($probe)" ;;
+		*) fail "guest PID 1 is not the guest init: /proc/1/cmdline = $probe" ;;
+	esac
+
+	# 2. execd is present and armed with --init.
+	execd_pid="$(guest_value EXECD_PID sh -c 'echo "EXECD_PID=$(pgrep -x execd | head -1)"')" \
+		|| fail "init-mode: execd pgrep probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	case "$execd_pid" in
+		''|*[!0-9]*) fail "execd process not found in the guest (EXECD_PID='$execd_pid')" ;;
+	esac
+	probe="$(guest_value INIT_FLAG sh -c "tr \"\\0\" \"\\n\" < /proc/$execd_pid/cmdline | grep -qx -- --init && echo INIT_FLAG=1")" \
+		|| fail "init-mode: execd cmdline probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	[[ "$probe" == "1" ]] \
+		|| fail "execd (pid $execd_pid) does not carry --init (cmdline probe output: $probe)"
+	pass "execd runs with --init (pid $execd_pid)"
+
+	# 3. execd is a direct child of PID 1 (bootstrap.sh exec'd away).
+	probe="$(guest_value EXECD_PPID sh -c "echo \"EXECD_PPID=\$(grep '^PPid:' /proc/$execd_pid/status | grep -o '[0-9]*')\"")" \
+		|| fail "init-mode: execd PPid probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	[[ "$probe" == "1" ]] \
+		|| fail "execd (pid $execd_pid) is not a child of PID 1: PPid=$probe"
+	pass "execd is a direct child of the guest init (PPid=1)"
+
+	# 4. The baked entrypoint is supervised by execd (its child, not a
+	#    sibling of bootstrap: the template default is tail -f /dev/null).
+	probe="$(guest_value TAIL_PPID sh -c 'p=$(pgrep -f "tail -f /dev/null" | head -1); echo "TAIL_PPID=$(grep "^PPid:" /proc/$p/status | grep -o "[0-9]*")"')" \
+		|| fail "init-mode: entrypoint PPid probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	[[ "$probe" == "$execd_pid" ]] \
+		|| fail "the entrypoint is not a child of execd (pid $execd_pid): entrypoint PPid=$probe"
+	pass "the baked entrypoint is supervised by execd (entrypoint PPid=$execd_pid)"
+
+	# 5. Subreaper semantics: an orphaned background process reparents to
+	#    execd (the nearest subreaper ancestor), not to PID 1.
+	guest_out sh -c 'sleep 30 >/dev/null 2>&1 & echo $! > /tmp/osb-init-mode-orphan.pid' >/dev/null \
+		|| fail "init-mode: orphan spawn failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	probe="$(guest_value ORPHAN_PPID sh -c 'p=$(cat /tmp/osb-init-mode-orphan.pid); echo "ORPHAN_PPID=$(grep "^PPid:" /proc/$p/status | grep -o "[0-9]*")"')" \
+		|| fail "init-mode: orphan PPid probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	[[ "$probe" == "$execd_pid" ]] \
+		|| fail "the orphan did not reparent to execd (pid $execd_pid): orphan PPid=$probe"
+	pass "orphaned processes reparent to execd (subreaper; orphan PPid=$execd_pid)"
+	guest_out sh -c 'kill $(cat /tmp/osb-init-mode-orphan.pid) 2>/dev/null; rm -f /tmp/osb-init-mode-orphan.pid' >/dev/null 2>&1 || true
+
+	# 6. The capabilities endpoint reports the fsb/Pool init tier: execd owns
+	#    the process tree as a subreaper; the kernel PID 1 signal shield
+	#    stays with the fsb guest init.
+	local hardening_line
+	hardening_line="$(guest_out curl -fsS http://127.0.0.1:44772/v1/isolated/capabilities 2>/dev/null \
+		| while IFS= read -r line || [[ -n "$line" ]]; do
+			printf '%s' "$line" | jq -ce '.hardening // empty' 2>/dev/null && break
+		done)" \
+		|| fail "init-mode: capabilities probe failed (no .hardening in the response): $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	log "verify (init-mode): hardening report: $hardening_line"
+	[[ "$(printf '%s' "$hardening_line" | jq -r '.init_mode')" == "subreaper" ]] \
+		|| fail "hardening.init_mode is not subreaper: $hardening_line"
+	[[ "$(printf '%s' "$hardening_line" | jq -r '.signal_shield')" == "false" ]] \
+		|| fail "hardening.signal_shield is not false (fsb guest init owns PID 1): $hardening_line"
+	pass "capabilities: hardening.init_mode=subreaper, signal_shield=false (fsb/Pool tier; no isolation TOML, floor layers stay disabled)"
+
+	osb_api sandbox kill "$VERIFY_ID" >/dev/null 2>&1 \
+		|| log "verify cleanup: kill failed; remove $VERIFY_ID manually"
+	wait_for "init-mode sandbox deleted" 120 verify_sandbox_gone
 }
 
 # --- stage: vault lifecycle (OSEP-0022: egress-held vault over the relay) --------
@@ -3467,6 +3598,7 @@ verify_native() {
 	TEMPLATE_ID="$(cat "$WORK/template-id" 2>/dev/null || true)"
 	[[ -n "$TEMPLATE_ID" ]] || die "no template id at $WORK/template-id (run up first; template_up stores it there)"
 	run_stage "end-to-end verify (API create -> gateway -> execd /ping)" opensandbox_verify
+	run_stage "execd-as-init verify (in-guest process topology)" init_mode_verify
 	run_stage "pause/resume verify (CLI -> FastPath checkpoint)" pause_resume_verify
 	run_stage "vault lifecycle verify (CLI -> relay -> egress-held vault)" vault_lifecycle_verify
 	run_stage "MITM CA chain verify (baked CA -> injection -> pinning)" mitm_ca_chain_verify
@@ -3485,6 +3617,7 @@ verify_overlaybd() {
 	run_stage "ublk add/del probe (node daemon -> kernel path)" ublk_probe_or_heal
 	run_stage "SandboxTemplate build (overlaybd, oci:// publication)" template_up_overlaybd
 	run_stage "end-to-end verify (overlaybd template)" opensandbox_verify "$OCI_TEMPLATE_ID"
+	run_stage "execd-as-init verify (overlaybd template)" init_mode_verify "$OCI_TEMPLATE_ID"
 	run_stage "pause/resume verify (overlaybd template)" pause_resume_verify "$OCI_TEMPLATE_ID"
 	run_stage "vault lifecycle verify (overlaybd template)" vault_lifecycle_verify "$OCI_TEMPLATE_ID"
 	run_stage "MITM CA chain verify (overlaybd template)" mitm_ca_chain_verify "$OCI_TEMPLATE_ID"
