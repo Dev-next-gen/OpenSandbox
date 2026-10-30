@@ -823,6 +823,24 @@ func (r *SandboxSnapshotReconciler) updateSnapshotStatusFromSucceededCommitJob(c
 				latest.Status.Containers[i].ImageDigest = digest
 			}
 		}
+		// resume restores rootfs-v1 containers exclusively by digest, so a
+		// snapshot published without them can never be resumed once
+		// completePause has deleted the pods. The commit result is the only
+		// source of those digests and lives only in the commit pod.
+		if latest.Status.Format == sandboxv1alpha1.SandboxSnapshotFormatRootfsV1 &&
+			latest.Status.Phase != sandboxv1alpha1.SandboxSnapshotPhaseSucceed {
+			if missing := containersWithoutDigest(latest.Status.Containers); len(missing) > 0 {
+				reason := "CommitResultIncomplete"
+				message := fmt.Sprintf("commit job succeeded without image digests for containers: %s", strings.Join(missing, ", "))
+				if !found {
+					reason = "CommitResultUnavailable"
+					message = fmt.Sprintf("commit job succeeded but its result is no longer available; image digests were not recorded for containers: %s", strings.Join(missing, ", "))
+				}
+				latest.Status.Phase = sandboxv1alpha1.SandboxSnapshotPhaseFailed
+				applySnapshotPhaseConditions(&latest.Status, reason, message)
+				return r.Status().Update(ctx, latest)
+			}
+		}
 		if latest.Status.Format == sandboxv1alpha1.SandboxSnapshotFormatQEMUV1 {
 			if !found || result.VirtualMachine == nil {
 				return fmt.Errorf("successful QEMU commit job did not report virtualMachine result")
@@ -851,6 +869,16 @@ func (r *SandboxSnapshotReconciler) updateSnapshotStatusFromSucceededCommitJob(c
 		applySnapshotPhaseConditions(&latest.Status, "", "")
 		return r.Status().Update(ctx, latest)
 	})
+}
+
+func containersWithoutDigest(containers []sandboxv1alpha1.ContainerSnapshot) []string {
+	var missing []string
+	for _, container := range containers {
+		if container.ImageDigest == "" {
+			missing = append(missing, container.ContainerName)
+		}
+	}
+	return missing
 }
 
 func (r *SandboxSnapshotReconciler) getCommitJobResult(ctx context.Context, namespace, jobName string) (*commitJobResult, bool, error) {
