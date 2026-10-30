@@ -61,13 +61,11 @@ PLURAL = "sandboxtemplates"
 # exist in the sandboxtemplate-builder image under this name (builder
 # default); execd comes from runtime.execd_image.
 TEMPLATE_KERNEL = "vmlinux.bin"
-# OSEP-0018 on fsb: the golden image's guest init sources the baked envs and
-# launches /opt/opensandbox/bootstrap.sh, so a baked EXECD_INIT=1 makes
-# bootstrap.sh exec into `execd --init` and execd becomes the root of the
-# workload tree — a subreaper, since the fsb guest init stays PID 1 (no
-# PID 1 signal shield, same tier as the Kubernetes Pool path). Injected at
-# CRD projection from runtime.execd_run_as_init; the server value wins over
-# a client-provided env of the same name.
+# OSEP-0018 on fsb: the guest init sources the baked envs and launches
+# bootstrap.sh, so a baked EXECD_INIT=1 makes bootstrap.sh exec into
+# `execd --init` — execd runs as a subreaper under the guest init (no PID 1
+# signal shield). Injected at CRD projection from runtime.execd_run_as_init;
+# the server value wins over a client-provided env of the same name.
 EXECD_INIT_ENV = "EXECD_INIT"
 DEFAULT_VCPU = "1"
 DEFAULT_MEMORY = "512Mi"

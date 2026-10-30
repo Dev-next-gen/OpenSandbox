@@ -30,11 +30,9 @@
 # server bakes it into the golden image, the pool pins the keypair into
 # mitmdump, and a guest HTTPS request proves the template↔pool fingerprint
 # pinning plus per-subject credential injection against a CA-signed TLS echo
-# endpoint, and the execd-as-init in-guest process verify (OSEP-0018: the
-# server config carries runtime.execd_run_as_init, so the guest boots
-# bootstrap.sh into `execd --init`; the stage pins PID 1 = guest init,
-# execd --init as its child, the entrypoint supervised by execd, orphan
-# reparenting to the subreaper, and hardening.init_mode=subreaper).
+# endpoint, and the execd-as-init in-guest process verify (OSEP-0018:
+# `execd --init` as a subreaper under the guest init — topology, reaping,
+# and the hardening report pinned in-guest).
 #
 # All Kubernetes resources come from the charts via `helm template` + plain
 # `kubectl apply` (no helm release state); the only env-owned manifests are
@@ -65,10 +63,8 @@
 #   SERVER_HOST_PORT / GATEWAY_HOST_PORT  host-side publishes (default 18080/18081)
 #   WARM_IMAGES=1        preheat pool warmImages (default: on-demand first-sandbox pull)
 #   SBX_IMAGE / EXECD    template build inputs   (default opensandbox/fsb-sandbox-golden:latest / opensandbox/execd:latest)
-#   EXECD_RUN_AS_INIT    OSEP-0018 execd-as-init (default true): the server
-#                    config sets runtime.execd_run_as_init so templates bake
-#                    EXECD_INIT=1; false restores the classic topology (the
-#                    init-mode verify stage fails by design)
+#   EXECD_RUN_AS_INIT    OSEP-0018 execd-as-init (default true); false =
+#                    classic topology (the init-mode verify stage fails)
 #   POOL_MIN / POOL_MAX  pool capacity           (default 2/2; auto 1/1 when KIND_SINGLE=1)
 #   MAX_SANDBOXES_PER_POD per-fastlet sandbox capacity (default 8)
 #   XFS_STATEROOT / XFS_SIZE  reflink StateRoot on/off and virtual size
@@ -139,12 +135,8 @@ RC_CONFIG_DIR="$WORK/rc-config"
 
 SBX_IMAGE="${SBX_IMAGE:-opensandbox/fsb-sandbox-golden:latest}"
 EXECD="${EXECD:-opensandbox/execd:latest}"
-# OSEP-0018 execd-as-init: the server config carries runtime.execd_run_as_init,
-# so every golden-image template bakes EXECD_INIT=1 and the guest boots
-# bootstrap.sh into `execd --init` (execd supervises the workload as a
-# subreaper under the fsb guest init; the init-mode verify stage pins the
-# in-guest process topology). Set EXECD_RUN_AS_INIT=false for the classic
-# background-and-wait topology (the init-mode verify stage will then fail).
+# OSEP-0018: bake EXECD_INIT=1 into templates (the init-mode verify stage
+# pins the in-guest topology); false restores the classic topology.
 EXECD_RUN_AS_INIT="${EXECD_RUN_AS_INIT:-true}"
 # WARM_IMAGES=1 preheats pool warmImages (keyed by template id); the default
 # is the on-demand first-sandbox pull through DART.
@@ -2386,9 +2378,7 @@ level = "INFO"
 [runtime]
 type = "kubernetes"
 execd_image = "@EXECD_IMAGE@"
-# OSEP-0018: templates bake EXECD_INIT=1 so the guest boots bootstrap.sh into
-# `execd --init` (subreaper under the fsb guest init); pinned by the
-# init-mode verify stage.
+# OSEP-0018: bake EXECD_INIT=1 into templates; pinned by the init-mode verify.
 execd_run_as_init = @EXECD_RUN_AS_INIT@
 
 [kubernetes]
@@ -2828,17 +2818,14 @@ pause_resume_verify() {
 
 # --- stage: execd-as-init in-guest process verify (OSEP-0018) -------------------
 # NOTE: verify/init-mode.sh carries the split-layout copy of this stage; keep
-# the two in sync until the env.sh split is completed and the verify scripts
-# become the single home.
+# the two in sync until the env.sh split is completed.
 
-# guest_out <words...>: run a command in the sandbox through the CLI; stdout
-# is the guest command's output (framing lines tolerated downstream).
+# guest_out <words...>: run a command in the sandbox via the CLI.
 guest_out() {
 	osb_api command run "$VERIFY_ID" -- "$@" 2>"$LOGS_DIR/init-mode-cmd.err"
 }
 
-# guest_value <key> <words...>: extract the VALUE of the guest's KEY=VALUE
-# line (first match wins; non-matching framing lines are skipped).
+# guest_value <key> <words...>: extract the guest's KEY=VALUE line.
 guest_value() { # <key> <probe-words...>
 	local key="$1" line
 	shift
@@ -2862,14 +2849,13 @@ init_mode_verify() { # [template-id]
 	[[ -n "$VERIFY_ID" && "$VERIFY_ID" != "null" ]] || fail "create response carried no id"
 	wait_for "init-mode target Running" 600 sandbox_running
 
-	# 0. The full in-guest process table, verbatim: the ground truth every
-	#    assertion below filters, and the first evidence a failure reads.
+	# Full process table first: ground truth + failure evidence.
 	log "verify (init-mode): in-guest process table (pid ppid pgid sid stat args):"
 	guest_out sh -c 'ps -eo pid,ppid,pgid,sid,stat,args || ps -ef' \
 		| tee "$LOGS_DIR/init-mode-processes.txt" >&2 \
 		|| log "verify (init-mode): process table dump failed (continuing; the probes below carry the diagnostics)"
 
-	# 1. PID 1 is the fsb guest init (not bootstrap.sh, not execd).
+	# 1. PID 1 is the guest init.
 	probe="$(guest_value PID1 sh -c 'echo "PID1=$(tr "\0" " " < /proc/1/cmdline)"')" \
 		|| fail "init-mode: /proc/1/cmdline probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	case "$probe" in
@@ -2877,7 +2863,7 @@ init_mode_verify() { # [template-id]
 		*) fail "guest PID 1 is not the guest init: /proc/1/cmdline = $probe" ;;
 	esac
 
-	# 2. execd is present and armed with --init.
+	# 2. execd armed with --init.
 	execd_pid="$(guest_value EXECD_PID sh -c 'echo "EXECD_PID=$(pgrep -x execd | head -1)"')" \
 		|| fail "init-mode: execd pgrep probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	case "$execd_pid" in
@@ -2889,25 +2875,21 @@ init_mode_verify() { # [template-id]
 		|| fail "execd (pid $execd_pid) does not carry --init (cmdline probe output: $probe)"
 	pass "execd runs with --init (pid $execd_pid)"
 
-	# 3. execd is a direct child of PID 1 (bootstrap.sh exec'd away).
+	# 3. execd is PID 1's child (bootstrap exec'd away).
 	probe="$(guest_value EXECD_PPID sh -c "echo \"EXECD_PPID=\$(grep '^PPid:' /proc/$execd_pid/status | grep -o '[0-9]*')\"")" \
 		|| fail "init-mode: execd PPid probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	[[ "$probe" == "1" ]] \
 		|| fail "execd (pid $execd_pid) is not a child of PID 1: PPid=$probe"
 	pass "execd is a direct child of the guest init (PPid=1)"
 
-	# 4. The baked entrypoint is supervised by execd (its child, not a
-	#    sibling of bootstrap: the template default is tail -f /dev/null).
+	# 4. The entrypoint is execd's child.
 	probe="$(guest_value TAIL_PPID sh -c 'p=$(pgrep -f "tail -f /dev/null" | head -1); echo "TAIL_PPID=$(grep "^PPid:" /proc/$p/status | grep -o "[0-9]*")"')" \
 		|| fail "init-mode: entrypoint PPid probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	[[ "$probe" == "$execd_pid" ]] \
 		|| fail "the entrypoint is not a child of execd (pid $execd_pid): entrypoint PPid=$probe"
 	pass "the baked entrypoint is supervised by execd (entrypoint PPid=$execd_pid)"
 
-	# 5. Subreaper semantics: an orphaned background process reparents to
-	#    execd (the nearest subreaper ancestor), not to PID 1. The orphan
-	#    sleeps briefly and is left to exit on its own so assertion 6 can
-	#    pin the reaping.
+	# 5. The orphan reparents to execd (subreaper); left to exit for #6.
 	guest_out sh -c 'sleep 6 >/dev/null 2>&1 & echo $! > /tmp/osb-init-mode-orphan.pid' >/dev/null \
 		|| fail "init-mode: orphan spawn failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	probe="$(guest_value ORPHAN_PPID sh -c 'p=$(cat /tmp/osb-init-mode-orphan.pid); echo "ORPHAN_PPID=$(grep "^PPid:" /proc/$p/status | grep -o "[0-9]*")"')" \
@@ -2916,26 +2898,21 @@ init_mode_verify() { # [template-id]
 		|| fail "the orphan did not reparent to execd (pid $execd_pid): orphan PPid=$probe"
 	pass "orphaned processes reparent to execd (subreaper; orphan PPid=$execd_pid)"
 
-	# 6. execd reaps the orphan: once it exits, /proc/<pid> must disappear
-	#    within the poll budget — a non-reaping parent would keep it as a
-	#    `Z` child forever (the OSEP-0018 reaper is SIGCHLD-driven with a
-	#    sweep backstop, so latency is well under the budget).
+	# 6. execd reaps the exited orphan (else it stays a Z child forever).
 	init_mode_orphan_reaped() {
 		[[ "$(guest_value REAPED sh -c 'p=$(cat /tmp/osb-init-mode-orphan.pid 2>/dev/null); if [ -n "$p" ] && [ ! -e "/proc/$p" ]; then echo "REAPED=1"; else echo "REAPED=0"; fi')" == "1" ]]
 	}
 	wait_for "execd reaps the exited orphan (pid gone from /proc)" 20 init_mode_orphan_reaped
 	guest_out sh -c 'rm -f /tmp/osb-init-mode-orphan.pid' >/dev/null 2>&1 || true
 
-	# 7. The whole process table ends zombie-free.
+	# 7. No zombies left.
 	probe="$(guest_value ZOMBIES sh -c 'echo "ZOMBIES=$(ps -eo stat | grep -c "^Z" || true)"')" \
 		|| fail "init-mode: zombie count probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	[[ "$probe" == "0" ]] \
 		|| fail "the guest process table carries zombies: $probe in Z state"
 	pass "guest process table is zombie-free after the orphan round trip"
 
-	# 8. The capabilities endpoint reports the fsb/Pool init tier: execd owns
-	#    the process tree as a subreaper; the kernel PID 1 signal shield
-	#    stays with the fsb guest init.
+	# 8. Report: subreaper tier, no signal shield.
 	local hardening_line
 	hardening_line="$(guest_out curl -fsS http://127.0.0.1:44772/v1/isolated/capabilities 2>/dev/null \
 		| while IFS= read -r line || [[ -n "$line" ]]; do
