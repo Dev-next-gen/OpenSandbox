@@ -303,7 +303,7 @@ HTTP framing: both transports issue `POST` with `Content-Type: application/json`
 ```jsonc
 // egress → resolver
 {
-  "subject": "s-<sandbox UID>", // authoritative, filled by egress; identical value in both profiles
+  "subject": "<sandboxId>",    // authoritative, filled by egress; the sandbox's external ID, identical in both profiles
   "credential": "spi-signer",
   "binding": "internal-api",
   "destination": {             // validated outbound destination, not the client-controlled Host
@@ -325,7 +325,7 @@ HTTP framing: both transports issue `POST` with `Content-Type: application/json`
 
 The `destination` block reflects the validated outbound destination as verified by the egress (scheme, authority including port, and SNI), so a resolver can bind a proof to the connection identity and distinguish `http://host` from `https://host`. Header names in the response are validated before injection.
 
-**Subject identity.** The wire value is `s-<sandbox UID>` in both profiles, so a resolver operator provisions exactly one identity namespace. The sidecar egress derives it from the sandbox identity provisioned to the egress process; the fast-sandbox egress derives it from the authoritative client-IP→subject registry seeded from the same sandbox UID. The raw client IP is never forwarded, and no protocol surface accepts a client-declared subject (R6).
+**Subject identity.** The wire value is the sandbox's `sandboxId` — the external, lifecycle-level identifier — identical in both profiles, so a resolver operator provisions exactly one identity namespace keyed on the identifier callers already use. `subject` is an egress-internal concept; it never crosses the resolver boundary. The egress fills the `sandboxId` authoritatively: the sidecar egress holds the identity of the sandbox it serves; the fast-sandbox egress maps the connection's source IP through its internal subject registry, which is seeded from the same `sandboxId`. The raw client IP is never forwarded, and no protocol surface accepts a client-declared subject (R6).
 
 Hard requirements on a resolver endpoint, none of which dictate an implementation:
 
@@ -368,7 +368,7 @@ Audit events gain fields, never values: `credential` (resolver name), `resolutio
 - Fail-closed matrix: resolver down, timeout, and captured-binding invalidation each deny without pass-through.
 - In-flight stability: an unrelated binding patch does not deny an admitted resolution; deleting or replacing the captured binding does.
 - Response bounds: oversized and over-count resolver responses are denied per request while sibling subjects and unrelated traffic are unaffected (R14).
-- Subject isolation: no protocol surface accepts a subject string; the resolver always receives the egress-derived subject, and the wire value `s-<sandbox UID>` is identical across profiles.
+- Subject isolation: no protocol surface accepts a subject string; the resolver always receives the egress-derived subject, and the wire value is the sandbox's `sandboxId`, identical across profiles.
 - Resolver access control: a sandbox process cannot obtain credential material by calling the resolver directly.
 - Sidecar resolver reachability: with an operator-provisioned reachability exclusion, the egress-originated HTTPS resolver dial succeeds while a sandbox process dialing the same endpoint is denied.
 - Redaction: injected dynamic values are removed from response headers by name and value; logs contain no values.
