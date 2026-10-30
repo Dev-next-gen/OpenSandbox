@@ -166,6 +166,16 @@ class DecisionSnapshotTest(unittest.TestCase):
             mutate(candidate)
             self.assert_rejected(candidate)
 
+    def test_rejects_exchange_marker_from_newer_egress(self):
+        """Version-skew gate: this validator predates OSEP-0025 exchange
+        markers, so a snapshot emitted by a newer egress must fail closed
+        here instead of degrading to an empty static binding."""
+        candidate = self.active()
+        candidate["fullRenderedBindings"][0]["exchange"] = {
+            "credential": "spi-signer"
+        }
+        self.assert_rejected(candidate)
+
     def test_accepts_empty_substitution_and_legacy_empty_wildcard_language(self):
         candidate = self.active()
         candidate["fullRenderedBindings"] = [
