@@ -61,6 +61,12 @@ PLURAL = "sandboxtemplates"
 # exist in the sandboxtemplate-builder image under this name (builder
 # default); execd comes from runtime.execd_image.
 TEMPLATE_KERNEL = "vmlinux.bin"
+# OSEP-0018 on fsb: the guest init sources the baked envs and launches
+# bootstrap.sh, so a baked EXECD_INIT=1 makes bootstrap.sh exec into
+# `execd --init` — execd runs as a subreaper under the guest init (no PID 1
+# signal shield). Injected at CRD projection from runtime.execd_run_as_init;
+# the server value wins over a client-provided env of the same name.
+EXECD_INIT_ENV = "EXECD_INIT"
 DEFAULT_VCPU = "1"
 DEFAULT_MEMORY = "512Mi"
 # Guest rootfs logical size when the client omits resourceLimits.disk. The
@@ -163,6 +169,7 @@ class FastSandboxTemplateService:
     ):
         self._config = config
         self._execd_image = config.runtime.execd_image
+        self._execd_run_as_init = bool(config.runtime.execd_run_as_init)
         self._repository = repository
         self._k8s_client = k8s_client
         self._k8s_config = config.kubernetes or KubernetesRuntimeConfig()
@@ -517,6 +524,10 @@ class FastSandboxTemplateService:
             },
         }
         env = record.spec.get("env") or {}
+        if self._execd_run_as_init:
+            # Copy first: the stored row keeps the client env untouched, and
+            # the server value wins over a client-provided EXECD_INIT.
+            env = {**env, EXECD_INIT_ENV: "1"}
         if env:
             spec["envs"] = [{"name": name, "value": value} for name, value in env.items()]
         # OSEP-0022 CA wiring: bake the pinned MITM CA Secret's certificate
