@@ -657,6 +657,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         self._ensure_secure_access_support(request)
         self._ensure_network_policy_support(request)
         resource_limits = self._prepare_resource_limits(request)
+        self._validate_volume_definitions(request)
         # Docker API calls block; keep them off the event loop.
         await asyncio.to_thread(self._validate_network_exists)
 

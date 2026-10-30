@@ -519,6 +519,23 @@ class TestEnsureVolumesValid:
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail["code"] == SandboxErrorCodes.DUPLICATE_VOLUME_NAME
 
+    @pytest.mark.parametrize("mount_path", ["/", "/mnt/data", "/mnt/data/", "/mnt/./data"])
+    def test_mount_destination_constraints_are_runtime_specific(self, mount_path):
+        volumes = [
+            Volume(
+                name="data",
+                pvc=PVC(claim_name="shared-data"),
+                mount_path="/mnt/data",
+            ),
+            Volume(
+                name="other",
+                pvc=PVC(claim_name="shared-data"),
+                mount_path=mount_path,
+            ),
+        ]
+
+        assert ensure_volumes_valid(volumes) is None
+
     def test_invalid_volume_name_rejected_by_pydantic(self):
         from pydantic import ValidationError
 

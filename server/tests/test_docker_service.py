@@ -4047,6 +4047,122 @@ class TestBuildVolumeBinds:
 @patch("opensandbox_server.services.docker.docker_service.docker")
 class TestDockerVolumeValidation:
 
+    @pytest.mark.parametrize("network_mode", ["host", "test-network"])
+    @pytest.mark.parametrize(
+        "name,mount_path,error_code",
+        [
+            ("data", "/mnt/other", SandboxErrorCodes.DUPLICATE_VOLUME_NAME),
+            ("other", "/mnt/data", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/mnt/data/", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/mnt/data/.", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/mnt/./data", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/mnt/cache/../data", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "//mnt/data", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "//", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/.", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/mnt/..", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/\\", SandboxErrorCodes.INVALID_MOUNT_PATH),
+            ("other", "/mnt/..\\", SandboxErrorCodes.INVALID_MOUNT_PATH),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_volumes_rejected_before_docker_calls(
+        self, mock_docker, name, mount_path, error_code, network_mode
+    ):
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = []
+        mock_client.api.inspect_volume.return_value = {"Name": "shared-data"}
+        mock_client.api.create_host_config.return_value = {}
+        mock_client.api.create_container.side_effect = DockerException("invalid mount destination")
+        mock_docker.from_env.return_value = mock_client
+        cfg = _app_config()
+        cfg.docker.network_mode = network_mode
+        service = DockerSandboxService(config=cfg)
+        mock_client.reset_mock()
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=120,
+            resourceLimits=ResourceLimits(root={}),
+            entrypoint=["python"],
+            volumes=[
+                Volume(
+                    name="data",
+                    pvc=PVC(claim_name="shared-data"),
+                    mount_path="/mnt/data",
+                ),
+                Volume(
+                    name=name,
+                    pvc=PVC(claim_name="shared-data"),
+                    mount_path=mount_path,
+                ),
+            ],
+        )
+
+        with (
+            patch.object(service, "_ensure_image_available"),
+            patch.object(service, "_prepare_sandbox_runtime"),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await service.create_sandbox(request)
+
+        assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
+        assert exc_info.value.detail["code"] == error_code
+        assert isinstance(exc_info.value.detail["message"], str)
+        mock_client.containers.create.assert_not_called()
+        mock_client.api.create_container.assert_not_called()
+        mock_client.api.inspect_volume.assert_not_called()
+        mock_client.api.create_volume.assert_not_called()
+        assert mock_client.mock_calls == []
+
+    @pytest.mark.parametrize(
+        "mount_path",
+        ["/mnt/data/cache", "/mnt/other", "/tmp/opensandbox-execd", "/mnt\\data", "/mnt/data\\"],
+    )
+    @pytest.mark.asyncio
+    async def test_nested_and_repeated_source_mounts_allowed(self, mock_docker, mount_path):
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = []
+        mock_client.api.inspect_volume.return_value = {"Name": "shared-data"}
+        mock_client.api.create_host_config.return_value = {}
+        mock_client.api.create_container.return_value = {"Id": "cid"}
+        mock_client.containers.get.return_value = MagicMock()
+        mock_docker.from_env.return_value = mock_client
+        service = DockerSandboxService(config=_app_config())
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=120,
+            resourceLimits=ResourceLimits(root={}),
+            entrypoint=["python"],
+            volumes=[
+                Volume(
+                    name="data",
+                    pvc=PVC(claim_name="shared-data"),
+                    mount_path="/mnt/data",
+                ),
+                Volume(
+                    name="other",
+                    pvc=PVC(claim_name="shared-data"),
+                    mount_path=mount_path,
+                ),
+            ],
+        )
+
+        with (
+            patch.object(service, "_ensure_image_available"),
+            patch.object(service, "_prepare_sandbox_runtime"),
+        ):
+            response = await service.create_sandbox(request)
+
+        assert response.status.state == "Running"
+        mock_client.api.create_container.assert_called_once()
+        assert mock_client.api.create_host_config.call_args.kwargs["binds"] == [
+            "shared-data:/mnt/data:rw",
+            f"shared-data:{mount_path}:rw",
+        ]
+
     @pytest.mark.asyncio
     async def test_pvc_volume_not_found_rejected(self, mock_docker):
         """PVC backend with non-existent Docker named volume should be rejected when createIfNotExists is false."""
