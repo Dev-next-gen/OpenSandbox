@@ -730,16 +730,6 @@ func (s *fastSandboxPolicyServer) attachment(subj subject.Subject) (actionhandle
 	return att, ok
 }
 
-// storePendingPolicy holds the SET_BINDING policy of a still-denying subject
-// until its data-plane-ready Hook activates it. DNS dispatch keeps denying
-// while the policy is only pending (fail closed).
-func (s *fastSandboxPolicyServer) storePendingPolicy(subj subject.Subject, pol *policy.NetworkPolicy) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pendingPolicies[subj] = pol
-	log.Infof("subject %s: policy stored (deny-first until data-plane-ready)", subj)
-}
-
 // clearPendingPolicy drops a subject's pending policy (binding removal or
 // unload).
 func (s *fastSandboxPolicyServer) clearPendingPolicy(subj subject.Subject) {
