@@ -35,7 +35,10 @@
 #      — the workload is supervised by execd, not a sibling shell.
 #   5. Subreaper semantics: an orphaned process reparents to execd (nearest
 #      subreaper ancestor), not to PID 1.
-#   6. execd /v1/isolated/capabilities reports hardening.init_mode =
+#   6. execd REAPS that orphan: after it exits, /proc/<pid> disappears
+#      within the poll budget (a non-reaping parent would leave it a `Z`
+#      child forever), and the whole process table ends zombie-free.
+#   7. execd /v1/isolated/capabilities reports hardening.init_mode =
 #      subreaper and signal_shield = false (the documented fsb/Pool tier).
 #
 # Guest-side tool expectations: the golden image (Debian + procps) provides
@@ -121,17 +124,35 @@ init_mode_verify() { # [template-id]
 	pass "the baked entrypoint is supervised by execd (entrypoint PPid=$execd_pid)"
 
 	# 5. Subreaper semantics: an orphaned background process reparents to
-	#    execd (the nearest subreaper ancestor), not to PID 1.
-	guest_out sh -c 'sleep 30 >/dev/null 2>&1 & echo $! > /tmp/osb-init-mode-orphan.pid' >/dev/null \
+	#    execd (the nearest subreaper ancestor), not to PID 1. The orphan
+	#    sleeps briefly and is left to exit on its own so assertion 6 can
+	#    pin the reaping.
+	guest_out sh -c 'sleep 6 >/dev/null 2>&1 & echo $! > /tmp/osb-init-mode-orphan.pid' >/dev/null \
 		|| fail "init-mode: orphan spawn failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	probe="$(guest_value ORPHAN_PPID sh -c 'p=$(cat /tmp/osb-init-mode-orphan.pid); echo "ORPHAN_PPID=$(grep "^PPid:" /proc/$p/status | grep -o "[0-9]*")"')" \
 		|| fail "init-mode: orphan PPid probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	[[ "$probe" == "$execd_pid" ]] \
 		|| fail "the orphan did not reparent to execd (pid $execd_pid): orphan PPid=$probe"
 	pass "orphaned processes reparent to execd (subreaper; orphan PPid=$execd_pid)"
-	guest_out sh -c 'kill $(cat /tmp/osb-init-mode-orphan.pid) 2>/dev/null; rm -f /tmp/osb-init-mode-orphan.pid' >/dev/null 2>&1 || true
 
-	# 6. The capabilities endpoint reports the fsb/Pool init tier: execd owns
+	# 6. execd reaps the orphan: once it exits, /proc/<pid> must disappear
+	#    within the poll budget — a non-reaping parent would keep it as a
+	#    `Z` child forever (the OSEP-0018 reaper is SIGCHLD-driven with a
+	#    sweep backstop, so latency is well under the budget).
+	init_mode_orphan_reaped() {
+		[[ "$(guest_value REAPED sh -c 'p=$(cat /tmp/osb-init-mode-orphan.pid 2>/dev/null); if [ -n "$p" ] && [ ! -e "/proc/$p" ]; then echo "REAPED=1"; else echo "REAPED=0"; fi')" == "1" ]]
+	}
+	wait_for "execd reaps the exited orphan (pid gone from /proc)" 20 init_mode_orphan_reaped
+	guest_out sh -c 'rm -f /tmp/osb-init-mode-orphan.pid' >/dev/null 2>&1 || true
+
+	# 7. The whole process table ends zombie-free.
+	probe="$(guest_value ZOMBIES sh -c 'echo "ZOMBIES=$(ps -eo stat | grep -c "^Z" || true)"')" \
+		|| fail "init-mode: zombie count probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	[[ "$probe" == "0" ]] \
+		|| fail "the guest process table carries zombies: $probe in Z state"
+	pass "guest process table is zombie-free after the orphan round trip"
+
+	# 8. The capabilities endpoint reports the fsb/Pool init tier: execd owns
 	#    the process tree as a subreaper; the kernel PID 1 signal shield
 	#    stays with the fsb guest init.
 	local hardening_line hardening
