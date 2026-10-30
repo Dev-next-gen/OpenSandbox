@@ -53,8 +53,8 @@ import random
 import socket
 import socketserver
 import ssl
+import stat
 import sys
-import threading
 import time
 import traceback
 from typing import Any
@@ -347,6 +347,12 @@ def build_server(
     """Construct (but do not start) the resolver server for one transport."""
     if transport == "uds":
         if os.path.exists(options.uds):
+            # Only a stale socket may be removed; never unlink an arbitrary
+            # filesystem object that happens to sit on the requested path.
+            if not stat.S_ISSOCK(os.stat(options.uds).st_mode):
+                raise SystemExit(
+                    f"--uds path exists and is not a socket: {options.uds}"
+                )
             os.unlink(options.uds)
         server = _UnixHTTPServer(options.uds, _Handler)
         os.chmod(options.uds, 0o660)
@@ -376,9 +382,9 @@ def serve(server: http.server.HTTPServer) -> None:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        pass  # Ctrl+C is the expected shutdown signal; cleanup runs below.
     finally:
-        server_close()
+        server.server_close()
         if server.transport == "uds":
             with contextlib.suppress(OSError):
                 os.unlink(server.server_address)

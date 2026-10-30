@@ -1413,6 +1413,7 @@ class SystemAddonActiveVaultStrictParseTest(unittest.TestCase):
     def test_exchange_marker_shape_rejects(self) -> None:
         markers = {
             "non-object": "spi-signer",
+            "null-object": None,
             "empty-object": {},
             "extra-key": {"credential": "spi-signer", "endpoint": "unix:///run/x.sock"},
             "missing-credential": {"endpoint": "unix:///run/x.sock"},

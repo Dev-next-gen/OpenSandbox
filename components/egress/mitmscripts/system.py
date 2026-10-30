@@ -864,12 +864,12 @@ def _parse_active_vault(payload: Any) -> ActiveVault:
 
 def _parse_active_vault_exchange(binding: dict[str, Any], index: int) -> dict[str, str] | None:
     """Validate the optional exchange marker: exactly ``{"credential": name}``
-    with explicitly empty ``headers``/``substitutions``; anything else fails
-    the snapshot closed.
+    with explicitly empty ``headers``/``substitutions``; any present value
+    (including ``null``) other than that shape fails the snapshot closed.
     """
-    raw_exchange = binding.get("exchange")
-    if raw_exchange is None:
+    if "exchange" not in binding:
         return None
+    raw_exchange = binding["exchange"]
     if not isinstance(raw_exchange, dict) or set(raw_exchange) != {"credential"}:
         raise ActiveVaultLookupError(
             f"active vault binding {index} exchange must contain only credential"
