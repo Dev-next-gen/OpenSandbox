@@ -28,20 +28,42 @@
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib.sh"
 
+# init_mode_entrypoint_probe: guest-side probe printing TAIL_PPID=<ppid> for
+# the baked entrypoint workload. Selection is the exact comm name (pgrep -x,
+# never -f) plus the exact argv, so the probe's own sh -c shell — whose
+# cmdline embeds this very text and whose PPid is execd — can never
+# self-match, and a same-name process with different args is skipped; it
+# exits nonzero when no matching workload exists.
+init_mode_entrypoint_probe='
+for p in $(pgrep -x tail); do
+	argv=$(tr "\0" "\n" </proc/$p/cmdline)
+	[ "$argv" = "$(printf "tail\n-f\n/dev/null")" ] || continue
+	echo "TAIL_PPID=$(grep "^PPid:" /proc/$p/status | grep -o "[0-9]*")"
+	exit 0
+done
+echo "init-mode probe: no tail -f /dev/null workload process in the guest" >&2
+exit 1
+'
+
 # guest_out <words...>: run a command in the sandbox via the CLI.
 guest_out() {
 	osb_api command run "$VERIFY_ID" -- "$@" 2>"$LOGS_DIR/init-mode-cmd.err"
 }
 
-# guest_value <key> <words...>: extract the guest's KEY=VALUE line.
+# guest_value <key> <words...>: extract the guest's KEY=VALUE line. The full
+# guest_out output is captured and its exit status checked before parsing, so
+# a CLI failure after the target line cannot satisfy the caller's probe.
 guest_value() { # <key> <probe-words...>
-	local key="$1" line
+	local key="$1" out status line
 	shift
+	out="$(guest_out "$@")"
+	status=$?
+	[[ "$status" -eq 0 ]] || return "$status"
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		case "$line" in
 			"$key="*) printf '%s\n' "${line#*=}"; return 0 ;;
 		esac
-	done < <(guest_out "$@")
+	done <<<"$out"
 	return 1
 }
 
@@ -90,9 +112,11 @@ init_mode_verify() { # [template-id]
 		|| fail "execd (pid $execd_pid) is not a child of PID 1: PPid=$probe"
 	pass "execd is a direct child of the guest init (PPid=1)"
 
-	# 4. The entrypoint is execd's child.
-	probe="$(guest_value TAIL_PPID sh -c 'p=$(pgrep -f "tail -f /dev/null" | head -1); echo "TAIL_PPID=$(grep "^PPid:" /proc/$p/status | grep -o "[0-9]*")"')" \
-		|| fail "init-mode: entrypoint PPid probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	# 4. The entrypoint is execd's child. Exact name + argv selection: a
+	# fuzzy pgrep -f would match the probe's own sh -c shell (the search
+	# text sits in its cmdline) and pass vacuously on its execd PPid.
+	probe="$(guest_value TAIL_PPID sh -c "$init_mode_entrypoint_probe")" \
+		|| fail "init-mode: entrypoint probe failed (no tail -f /dev/null workload in the guest?): $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
 	[[ "$probe" == "$execd_pid" ]] \
 		|| fail "the entrypoint is not a child of execd (pid $execd_pid): entrypoint PPid=$probe"
 	pass "the baked entrypoint is supervised by execd (entrypoint PPid=$execd_pid)"
@@ -120,13 +144,15 @@ init_mode_verify() { # [template-id]
 		|| fail "the guest process table carries zombies: $probe in Z state"
 	pass "guest process table is zombie-free after the orphan round trip"
 
-	# 8. Report: subreaper tier, no signal shield.
-	local hardening_line
-	hardening_line="$(guest_out curl -fsS http://127.0.0.1:44772/v1/isolated/capabilities 2>/dev/null \
-		| while IFS= read -r line || [[ -n "$line" ]]; do
-			printf '%s' "$line" | jq -ce '.hardening // empty' 2>/dev/null && break
-		done)" \
-		|| fail "init-mode: capabilities probe failed (no .hardening in the response): $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	# 8. Report: subreaper tier, no signal shield. Capture the full response
+	# and check the producer status before scanning for .hardening.
+	local hardening_line capabilities_out
+	capabilities_out="$(guest_out curl -fsS http://127.0.0.1:44772/v1/isolated/capabilities 2>/dev/null)" \
+		|| fail "init-mode: capabilities probe failed: $(head -c 300 "$LOGS_DIR/init-mode-cmd.err" 2>/dev/null)"
+	hardening_line="$(printf '%s' "$capabilities_out" | while IFS= read -r line || [[ -n "$line" ]]; do
+		printf '%s' "$line" | jq -ce '.hardening // empty' 2>/dev/null && break
+	done)" \
+		|| fail "init-mode: capabilities probe failed (no .hardening in the response)"
 	log "verify (init-mode): hardening report: $hardening_line"
 	[[ "$(printf '%s' "$hardening_line" | jq -r '.init_mode')" == "subreaper" ]] \
 		|| fail "hardening.init_mode is not subreaper: $hardening_line"
