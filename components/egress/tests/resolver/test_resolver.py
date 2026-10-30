@@ -95,10 +95,21 @@ class _UnixConnection(http.client.HTTPConnection):
 
 
 class _ResolverProcess:
-    """Run one resolver server instance in a background thread."""
+    """Run one resolver server instance in a background thread.
 
-    def __init__(self, server: Any) -> None:
+    Every response carries ``Connection: close`` (mirroring the revision IPC
+    discipline: one request per connection), so clients must open a fresh
+    connection per request; reusing one trips over the server-side close.
+    Handler-side exceptions are recorded on the server instead of being
+    swallowed and are asserted here unless they belong to the expected
+    client-abort class (``allow_client_aborts``, e.g. the delay test).
+    """
+
+    CLIENT_ABORT_ERRORS = ("BrokenPipeError", "ConnectionResetError")
+
+    def __init__(self, server: Any, *, allow_client_aborts: bool = False) -> None:
         self.server = server
+        self.allow_client_aborts = allow_client_aborts
         self._thread = threading.Thread(target=server.serve_forever, daemon=True)
 
     def __enter__(self) -> "_ResolverProcess":
@@ -108,6 +119,17 @@ class _ResolverProcess:
     def __exit__(self, *_exc: object) -> None:
         self.server.shutdown()
         self.server.server_close()
+        records = list(getattr(self.server, "exceptions", []))
+        if self.allow_client_aborts:
+            records = [
+                record
+                for record in records
+                if not any(name in record for name in self.CLIENT_ABORT_ERRORS)
+            ]
+        if records:
+            raise AssertionError(
+                "resolver handler raised unexpectedly:\n" + "\n".join(records)
+            )
 
 
 def build_uds_server(socket_path: str, argv: list[str] | None = None) -> Any:
@@ -141,10 +163,10 @@ class ResolverUDSTest(unittest.TestCase):
         self.socket_path = os.path.join(self._tmp.name, "resolver.sock")
 
     def post(self, body: bytes, headers: dict[str, str] | None = None,
-             timeout: float = 10) -> tuple[int, bytes]:
+             timeout: float = 10, path: str = RESOLVE_PATH) -> tuple[int, bytes]:
         connection = _UnixConnection(self.socket_path, timeout=timeout)
         try:
-            connection.request("POST", RESOLVE_PATH, body=body, headers={
+            connection.request("POST", path, body=body, headers={
                 "Content-Type": "application/json",
                 **(headers or {}),
             })
@@ -196,17 +218,13 @@ class ResolverUDSTest(unittest.TestCase):
         )
 
     def test_fixed_service_path_rejects_other_paths_with_404(self) -> None:
-        connection = _UnixConnection(self.socket_path)
+        # One fresh connection per request: the resolver replies with
+        # ``Connection: close`` and closes the socket, so reusing a
+        # connection across requests races the server-side close.
         with _ResolverProcess(build_uds_server(self.socket_path)):
             for path in ("/", "/resolve/", "/v1/resolve"):
-                connection.request("POST", path, body=dumps(VALID_REQUEST), headers={
-                    "Content-Type": "application/json",
-                })
-                response = connection.getresponse()
-                status = response.status
-                response.read()
+                status, _ = self.post(dumps(VALID_REQUEST), path=path)
                 self.assertEqual(404, status, path)
-        connection.close()
 
     def test_uds_mode_ignores_host_header(self) -> None:
         connection = _UnixConnection(self.socket_path)
@@ -415,7 +433,10 @@ class ResolverFaultInjectionTest(unittest.TestCase):
 
     def test_delay_exceeds_client_timeout(self) -> None:
         server = build_uds_server(self.socket_path, ["--delay", "1000"])
-        with _ResolverProcess(server):
+        # The client aborts at 0.2s while the handler is still sleeping, so
+        # the handler's eventual write raises a client-abort error that the
+        # harness tolerates; anything else still fails the test.
+        with _ResolverProcess(server, allow_client_aborts=True):
             started = time.monotonic()
             with self.assertRaises((TimeoutError, OSError)):
                 self._post(timeout=0.2)

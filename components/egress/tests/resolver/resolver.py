@@ -85,6 +85,7 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 from typing import Any
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -245,7 +246,10 @@ class _UnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.server_port = 0
 
     def handle_error(self, _request: object, _address: object) -> None:
-        pass
+        # Record instead of swallow: tests assert this list stays empty, so
+        # handler bugs surface as server-side failures instead of mystery
+        # client errors such as BrokenPipeError on a socket we closed.
+        self.exceptions.append(traceback.format_exc())
 
 
 class _TCPHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -253,7 +257,7 @@ class _TCPHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
     def handle_error(self, _request: object, _address: object) -> None:
-        pass
+        self.exceptions.append(traceback.format_exc())
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -393,6 +397,7 @@ def build_server(
     server.transport = transport
     server.expected_token = expected_token
     server.options = options
+    server.exceptions = []
     server.request_timeout = max(30.0, options.delay / 1000.0 * 2 + 5.0)
     return server
 
