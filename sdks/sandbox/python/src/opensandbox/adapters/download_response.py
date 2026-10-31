@@ -94,11 +94,15 @@ class _AsyncResponseByteStream:
             raise StopAsyncIteration
         try:
             return await self._iterator.__anext__()
-        except BaseException as e:
+        except StopAsyncIteration:
             await self.aclose()
-            if isinstance(e, Exception) and not isinstance(e, StopAsyncIteration):
-                # Same mapping as the request itself, e.g. a reset mid-body.
-                raise ExceptionConverter.to_sandbox_exception(e) from e
+            raise
+        except Exception as e:
+            await self.aclose()
+            # Same mapping as the request itself, e.g. a reset mid-body.
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+        except BaseException:
+            await self.aclose()
             raise
 
     async def aclose(self) -> None:
@@ -131,11 +135,15 @@ class _ResponseByteStream:
             raise StopIteration
         try:
             return next(self._iterator)
-        except BaseException as e:
+        except StopIteration:
             self.close()
-            if isinstance(e, Exception) and not isinstance(e, StopIteration):
-                # Same mapping as the request itself, e.g. a reset mid-body.
-                raise ExceptionConverter.to_sandbox_exception(e) from e
+            raise
+        except Exception as e:
+            self.close()
+            # Same mapping as the request itself, e.g. a reset mid-body.
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+        except BaseException:
+            self.close()
             raise
 
     def close(self) -> None:
