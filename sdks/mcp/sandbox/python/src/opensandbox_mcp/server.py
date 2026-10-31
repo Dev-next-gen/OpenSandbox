@@ -130,13 +130,13 @@ def register_tools(
             # "Error executing tool"; SDK errors (not found, auth, ...) are
             # expected outcomes the client needs to see.
             @functools.wraps(func)
-            async def call(*args, **kwargs):
+            async def wrapper(*args, **kwargs):
                 try:
                     return await func(*args, **kwargs)
                 except SandboxException as exc:
                     raise ToolError(str(exc)) from exc
 
-            return mcp.tool()(call)
+            return mcp.tool()(wrapper)
 
         return decorator
 
