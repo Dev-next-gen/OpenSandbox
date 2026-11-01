@@ -84,12 +84,13 @@ func TestResolverRedactionsAreIncrementalR9(t *testing.T) {
 
 func TestCanonicalResolverRedactionsOrdering(t *testing.T) {
 	ordered := canonicalResolverRedactions([]string{"ccc", "bb", "a", "bb", ""})
-	require.Equal(t, []string{"a", "bb", "ccc"}, ordered)
+	require.Equal(t, []string{"ccc", "bb", "a"}, ordered)
 
 	ordered = canonicalResolverRedactions([]string{"b", "a"})
 	require.Equal(t, []string{"a", "b"}, ordered)
 
-	// The order matches the decision-snapshot canonical form.
+	// The order matches the decision-snapshot canonical form (longest
+	// first, ties ascending) — the mixed-length case enforces direction.
 	require.True(t, canonicalRedactions(ordered))
 }
 

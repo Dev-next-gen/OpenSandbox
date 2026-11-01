@@ -393,16 +393,16 @@ func (c *resolverClient) Resolve(ctx context.Context, input ResolveInput) (*Reso
 		return nil, err
 	}
 
-	// Bound in-flight resolves; acquire honors cancellation.
+	// The deadline bounds the whole call — queueing included — so queued
+	// resolves cannot stack one timeout per pending batch.
+	callCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
 	select {
 	case c.concurrency <- struct{}{}:
 		defer func() { <-c.concurrency }()
-	case <-ctx.Done():
-		return nil, &ResolverError{Kind: ResolverTimeout, err: ctx.Err()}
+	case <-callCtx.Done():
+		return nil, &ResolverError{Kind: ResolverTimeout, err: callCtx.Err()}
 	}
-
-	callCtx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
 
 	request, err := http.NewRequestWithContext(callCtx, http.MethodPost, c.requestURL, bytes.NewReader(document))
 	if err != nil {
@@ -714,8 +714,8 @@ func strictJSONObject(data []byte) (map[string]json.RawMessage, error) {
 	return fields, nil
 }
 
-// canonicalResolverRedactions dedups and orders values by length then
-// bytes (decision-snapshot canonical form).
+// canonicalResolverRedactions dedups and orders values longest-first with
+// ascending byte tie-break (decision-snapshot canonical form).
 func canonicalResolverRedactions(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	merged := make([]string, 0, len(values))
@@ -731,7 +731,7 @@ func canonicalResolverRedactions(values []string) []string {
 	}
 	sort.Slice(merged, func(i, j int) bool {
 		if len(merged[i]) != len(merged[j]) {
-			return len(merged[i]) < len(merged[j])
+			return len(merged[i]) > len(merged[j])
 		}
 		return merged[i] < merged[j]
 	})
