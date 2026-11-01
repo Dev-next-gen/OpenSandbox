@@ -16,18 +16,15 @@ package credentialvault
 
 import "strings"
 
-// Resolver response → interception decision (OSEP-0025 R9): the resolved
-// headers themselves drive the suppress and redaction derivation; anything
-// the resolver volunteers as redactions is merged incrementally and is never
-// authoritative. The derived set cannot be shrunk by the response.
+// Resolver response → interception decision (OSEP-0025 R9): resolved headers
+// drive the derivation; resolver-volunteered redactions merge incrementally
+// and can never shrink the derived set.
 
-// deriveResolverDecision builds the per-request decision from a validated
-// envelope. For every resolved header: the lowercased name joins the suppress
-// set and the value joins the redaction set through the same 7-variant
-// expansion used for substitutions (raw, URL-escaped ×2 case forms,
-// form-escaped ×2 case forms, JSON-escaped ×2 encodings —
-// substitutionRedactionVariants). Resolver-provided redactions are additive
-// only, deduped, and never remove derived entries.
+// deriveResolverDecision builds the decision from a validated envelope: each
+// header's lowercased name joins the suppress set and its value joins the
+// redactions via the 7-variant substitution expansion
+// (substitutionRedactionVariants); resolver redactions are additive and
+// deduped.
 func deriveResolverDecision(headers map[string]string, resolverRedactions map[string][]string) *ResolverDecision {
 	decision := &ResolverDecision{
 		Headers:  headers,
@@ -38,8 +35,7 @@ func deriveResolverDecision(headers map[string]string, resolverRedactions map[st
 		decision.Suppress[strings.ToLower(name)] = struct{}{}
 		redactions = append(redactions, substitutionRedactionVariants(value)...)
 	}
-	// R9: resolver-supplied redactions merge incrementally only — they can
-	// add entries but never remove or replace the derived ones.
+	// R9: resolver redactions only add, never remove derived entries.
 	for _, values := range resolverRedactions {
 		redactions = append(redactions, values...)
 	}

@@ -37,44 +37,31 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 )
 
-// Egress → credential header resolver client (OSEP-0025, frozen contract
-// §3.3): one POSTed JSON request document answered with a header map plus
-// optional incremental redactions. The envelope is untrusted input (D14):
-// every response over a limit is a per-request denial, never a global fault.
+// Egress → credential header resolver client (OSEP-0025 frozen contract).
+// The envelope is untrusted input (D14): over-limit responses are per-request
+// denials, never global faults.
 
 const (
-	// maxResolverResponseBytes (D14): total response body byte cap.
-	maxResolverResponseBytes = 64 << 10
-	// maxResolverHeaderCount (D14): header entries per response.
-	maxResolverHeaderCount = 16
-	// maxResolverValueBytes (D14): single header name/value or redaction value cap.
-	maxResolverValueBytes = 8 << 10
-	// maxResolverRedactionCount (D14): total resolver-provided redaction values.
+	// D14 envelope caps.
+	maxResolverResponseBytes  = 64 << 10
+	maxResolverHeaderCount    = 16
+	maxResolverValueBytes     = 8 << 10
 	maxResolverRedactionCount = 64
-	// maxResolverResponseHeaderBytes caps the HTTP response header block itself.
+	// Caps the HTTP response header block itself, not the JSON body.
 	maxResolverResponseHeaderBytes = 8 << 10
 )
 
-// ResolverErrorKind classifies a failed resolve for the interception path.
-// Denied/invalid/rejected/timeout/unavailable are all per-request outcomes:
-// the request proceeds without resolver headers (fail closed), the client
-// itself stays healthy.
+// ResolverErrorKind classifies a failed resolve; all kinds are per-request
+// outcomes and fail closed.
 type ResolverErrorKind string
 
 const (
-	// ResolverInvalidRequest: caller-supplied input violates the request contract.
-	ResolverInvalidRequest ResolverErrorKind = "invalid_request"
-	// ResolverUnavailable: transport failure (dial/write/read error).
-	ResolverUnavailable ResolverErrorKind = "unavailable"
-	// ResolverTimeout: per-call deadline exceeded.
-	ResolverTimeout ResolverErrorKind = "timeout"
-	// ResolverRejected: resolver answered with a non-200 status.
-	ResolverRejected ResolverErrorKind = "rejected"
-	// ResolverInvalidResponse: 200 but the body is not the contracted JSON envelope.
-	ResolverInvalidResponse ResolverErrorKind = "invalid_response"
-	// ResolverDenied (D14/R14): envelope limit exceeded or header name denied —
-	// per-request denial.
-	ResolverDenied ResolverErrorKind = "denied"
+	ResolverInvalidRequest  ResolverErrorKind = "invalid_request"
+	ResolverUnavailable     ResolverErrorKind = "unavailable"
+	ResolverTimeout         ResolverErrorKind = "timeout"
+	ResolverRejected        ResolverErrorKind = "rejected"         // non-200
+	ResolverInvalidResponse ResolverErrorKind = "invalid_response" // 200, bad envelope
+	ResolverDenied          ResolverErrorKind = "denied"           // D14/R14
 )
 
 // ResolverError is the typed failure of one resolve call.
@@ -103,8 +90,7 @@ func resolverErrorf(kind ResolverErrorKind, reason string) *ResolverError {
 	return &ResolverError{Kind: kind, Reason: reason}
 }
 
-// ResolverClient resolves one HTTP exchange's credential headers against the
-// credential header resolver.
+// ResolverClient resolves one exchange's credential headers.
 type ResolverClient interface {
 	Resolve(ctx context.Context, input ResolveInput) (*ResolverDecision, error)
 }
@@ -113,13 +99,12 @@ type ResolverClient interface {
 type ResolveInput struct {
 	// Subject is the egress-authoritative sandboxId.
 	Subject string
-	// Credential and Binding name the vault credential and binding whose
-	// headers the resolver renders.
+	// Credential and Binding name the vault credential and binding.
 	Credential string
 	Binding    string
-	// Destination is the target origin of the intercepted exchange.
+	// Destination is the intercepted target origin.
 	Destination ResolveDestination
-	// Request describes the outbound request frame the headers apply to.
+	// Request is the outbound frame the headers apply to.
 	Request ResolveRequestFrame
 }
 
@@ -138,10 +123,9 @@ type ResolveRequestFrame struct {
 	Headers map[string]string
 }
 
-// ResolverDecision is the validated per-request outcome: headers to inject,
-// the header names to suppress from passthrough, and the merged redaction
-// set (derived variants are authoritative; resolver-provided redactions are
-// incremental only, R9).
+// ResolverDecision is the validated outcome: headers to inject, names to
+// suppress, and merged redactions (derived variants authoritative; resolver
+// redactions incremental only, R9).
 type ResolverDecision struct {
 	Headers    map[string]string
 	Suppress   map[string]struct{} // lowercase header names
@@ -150,24 +134,22 @@ type ResolverDecision struct {
 
 // ResolverClientOptions constructs one client.
 type ResolverClientOptions struct {
-	// Endpoint is the resolver URI: "uds:///absolute/socket/path" or
-	// "unix://..." (alias) or "https://host[:port][/prefix]".
+	// Endpoint is "uds:///absolute/socket/path", "unix://..." (alias), or
+	// "https://host[:port][/prefix]".
 	Endpoint string
-	// Timeout bounds every resolve call; 0 selects the configured default.
+	// Timeout bounds every resolve call; 0 selects the default.
 	Timeout time.Duration
-	// MaxConcurrency bounds in-flight resolves; 0 selects the configured default.
+	// MaxConcurrency bounds in-flight resolves; 0 selects the default.
 	MaxConcurrency int
-	// Auth maps normalized origins ("https://host:port") to the bearer token
-	// presented for that origin only (D5). Endpoints without a matching
-	// origin resolve without an Authorization header.
+	// Auth maps normalized origins ("https://host:port") to bearer tokens
+	// (D5); unmatched origins resolve without an Authorization header.
 	Auth map[string]string
-	// TLSClientConfig overrides the HTTPS transport TLS configuration (test
-	// and deployment seam). Nil selects system verification.
+	// TLSClientConfig overrides HTTPS TLS (test/deployment seam); nil keeps
+	// system verification.
 	TLSClientConfig *tls.Config
 }
 
-// NewResolverClient validates the endpoint and constructs the transport
-// without dialing.
+// NewResolverClient validates the endpoint; no connection is dialed.
 func NewResolverClient(options ResolverClientOptions) (ResolverClient, error) {
 	if options.Timeout <= 0 {
 		options.Timeout = ResolverTimeoutFromEnv()
@@ -212,9 +194,7 @@ func NewResolverClient(options ResolverClientOptions) (ResolverClient, error) {
 		if parsed.origin == "" {
 			return nil, resolverErrorf(ResolverInvalidRequest, "missing_https_origin")
 		}
-		// Proxy stays nil: the resolver hop is direct TLS and must never
-		// chain through an outbound proxy (the bearer token must not leak
-		// to one).
+		// Proxy stays nil: the token must never leak through an outbound proxy.
 		transport = &http.Transport{
 			DisableKeepAlives:      true,
 			ForceAttemptHTTP2:      false,
@@ -241,9 +221,8 @@ type parsedResolverEndpoint struct {
 	resolvePath string // request target: prefix + "/resolve"
 }
 
-// parseResolverEndpoint validates the resolver URI and derives the framing
-// (D15): https endpoints may carry a path prefix; the resolve target is
-// prefix + "/resolve". Unix endpoints carry no prefix.
+// parseResolverEndpoint derives the D15 framing: https targets are
+// prefix + "/resolve"; unix endpoints carry no prefix.
 func parseResolverEndpoint(endpoint string) (*parsedResolverEndpoint, error) {
 	raw, err := url.Parse(strings.TrimSpace(endpoint))
 	if err != nil {
@@ -291,8 +270,7 @@ func parseResolverEndpoint(endpoint string) (*parsedResolverEndpoint, error) {
 	}
 }
 
-// normalizeResolverOrigin canonicalizes an https URL to "https://host:port"
-// (D5): lowercase scheme and host, explicit port (443 added when absent).
+// normalizeResolverOrigin canonicalizes to "https://host:port" (D5).
 func normalizeResolverOrigin(u *url.URL) (string, error) {
 	if strings.ToLower(u.Scheme) != "https" {
 		return "", resolverErrorf(ResolverInvalidRequest, "origin_requires_https_scheme")
@@ -311,10 +289,8 @@ func normalizeResolverOrigin(u *url.URL) (string, error) {
 	return "https://" + host + ":" + port, nil
 }
 
-// ParseResolverAuthEnv parses OPENSANDBOX_EGRESS_CREDENTIAL_RESOLVER_AUTH
-// (D5): comma-separated "origin=token" entries. Origins are normalized; a
-// malformed entry is a configuration error (fail closed), and an empty token
-// is rejected rather than treated as "no auth".
+// ParseResolverAuthEnv parses "origin=token,..." entries (D5). Origins are
+// normalized; malformed entries and empty tokens fail closed.
 func ParseResolverAuthEnv(raw string) (map[string]string, error) {
 	tokens := make(map[string]string)
 	for _, entry := range strings.Split(raw, ",") {
@@ -345,17 +321,16 @@ func normalizeResolverOriginString(origin string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// D5 key format is exactly scheme://host:port — an operator writing a
-	// path/query-qualified origin would silently broaden the token's scope
-	// after normalization, so reject rather than accept.
+	// Reject path-qualified origins: normalization would silently broaden
+	// the token's scope (D5 keys are exactly scheme://host:port).
 	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
 		return "", errors.New("origin must be scheme://host:port")
 	}
 	return normalizeResolverOrigin(parsed)
 }
 
-// ResolverTimeoutFromEnv reads OPENSANDBOX_EGRESS_CREDENTIAL_RESOLVER_TIMEOUT
-// (seconds); unparseable or out-of-range values keep the default.
+// ResolverTimeoutFromEnv reads the timeout env (seconds); bad values keep
+// the default.
 func ResolverTimeoutFromEnv() time.Duration {
 	seconds := constants.EnvIntRange(
 		constants.EnvCredentialResolverTimeout,
@@ -365,9 +340,8 @@ func ResolverTimeoutFromEnv() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// ResolverMaxConcurrencyFromEnv reads
-// OPENSANDBOX_EGRESS_CREDENTIAL_RESOLVER_MAX_CONCURRENCY; unparseable or
-// out-of-range values keep the default.
+// ResolverMaxConcurrencyFromEnv reads the concurrency env; bad values keep
+// the default.
 func ResolverMaxConcurrencyFromEnv() int {
 	return constants.EnvIntRange(
 		constants.EnvCredentialResolverMaxConcurrency,
@@ -376,9 +350,8 @@ func ResolverMaxConcurrencyFromEnv() int {
 	)
 }
 
-// NewResolverClientFromEnv constructs a client from the three resolver
-// environment variables (endpoint supplied by the caller — there is no
-// endpoint env; wiring owns it).
+// NewResolverClientFromEnv builds a client from the resolver envs; wiring
+// supplies the endpoint.
 func NewResolverClientFromEnv(endpoint string) (ResolverClient, error) {
 	auth, err := authTokensFromEnv()
 	if err != nil {
@@ -398,8 +371,7 @@ func authTokensFromEnv() (map[string]string, error) {
 	return ParseResolverAuthEnv(raw)
 }
 
-// resolverClient is the UDS/HTTPS resolver transport. The zero value is not
-// usable; construct through NewResolverClient.
+// resolverClient is the UDS/HTTPS transport; construct via NewResolverClient.
 type resolverClient struct {
 	http          *http.Client
 	requestURL    string
@@ -411,8 +383,7 @@ type resolverClient struct {
 
 var _ ResolverClient = (*resolverClient)(nil)
 
-// Resolve performs one resolution. Failures are typed ResolverError values;
-// envelope violations (D14) are per-request denials.
+// Resolve performs one resolution; failures are typed ResolverError values.
 func (c *resolverClient) Resolve(ctx context.Context, input ResolveInput) (*ResolverDecision, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, &ResolverError{Kind: ResolverTimeout, err: err}
@@ -422,7 +393,7 @@ func (c *resolverClient) Resolve(ctx context.Context, input ResolveInput) (*Reso
 		return nil, err
 	}
 
-	// Bound in-flight resolves; the acquire honors caller cancellation.
+	// Bound in-flight resolves; acquire honors cancellation.
 	select {
 	case c.concurrency <- struct{}{}:
 		defer func() { <-c.concurrency }()
@@ -439,8 +410,7 @@ func (c *resolverClient) Resolve(ctx context.Context, input ResolveInput) (*Reso
 	}
 	request.Header.Set("Content-Type", "application/json")
 	if c.hostHeader != "" {
-		// D15: Host is the endpoint authority (https) or localhost (unix,
-		// applied by the request URL above).
+		// D15: Host is the endpoint authority (localhost over unix).
 		request.Host = c.hostHeader
 	}
 	if c.authorization != "" {
@@ -458,8 +428,7 @@ func (c *resolverClient) Resolve(ctx context.Context, input ResolveInput) (*Reso
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		// Drain a little so the connection can be reclaimed without letting
-		// the peer stream unbounded bytes into the client.
+		// Drain a little so the peer cannot stream unbounded bytes.
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResolverResponseHeaderBytes))
 		return nil, &ResolverError{Kind: ResolverRejected, Status: response.StatusCode}
 	}
@@ -469,7 +438,7 @@ func (c *resolverClient) Resolve(ctx context.Context, input ResolveInput) (*Reso
 
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxResolverResponseBytes+1))
 	if err != nil {
-		// A trickling body past the deadline is a timeout, not unavailability.
+		// A body trickling past the deadline is a timeout, not unavailability.
 		if callCtx.Err() != nil {
 			return nil, &ResolverError{Kind: ResolverTimeout, err: callCtx.Err()}
 		}
@@ -485,8 +454,8 @@ func (c *resolverClient) Resolve(ctx context.Context, input ResolveInput) (*Reso
 	return deriveResolverDecision(envelope.headers, envelope.redactions), nil
 }
 
-// marshalResolveInput validates the request-side contract (mirror of the
-// resolver's own validation) and encodes the exact request document.
+// marshalResolveInput validates the request contract and encodes the exact
+// wire document.
 func marshalResolveInput(input ResolveInput) ([]byte, error) {
 	nonEmpty := func(value string) bool { return value != "" }
 	switch {
@@ -508,9 +477,8 @@ func marshalResolveInput(input ResolveInput) ([]byte, error) {
 	}
 	requestHeaders := input.Request.Headers
 	if requestHeaders == nil {
-		// D15 wire shape: the frozen contract requires request.headers to be
-		// a JSON object; a nil Go map would serialize as null and be
-		// rejected by a contract-compliant resolver.
+		// D15: request.headers must be a JSON object; a nil Go map would
+		// serialize as null.
 		requestHeaders = map[string]string{}
 	}
 	document := resolveRequestDocument{
@@ -560,10 +528,9 @@ type resolveRequestFrameDocument struct {
 	Headers map[string]string `json:"headers"`
 }
 
-// decodeResolveResponse strictly decodes the response envelope: exactly the
-// contracted fields, no duplicate keys, no unknown fields, no nulls, no
-// trailing data (D14). Limit violations are ResolverDenied; schema violations
-// are ResolverInvalidResponse.
+// decodeResolveResponse strictly decodes the envelope: exact fields only,
+// no duplicates/nulls/trailing data. Limits are ResolverDenied; schema
+// violations are ResolverInvalidResponse.
 func decodeResolveResponse(data []byte) (*resolveResponseDocument, error) {
 	fields, err := strictJSONObject(data)
 	if err != nil {
@@ -598,10 +565,8 @@ type resolveResponseDocument struct {
 	redactions map[string][]string
 }
 
-// decodeHeaderMap validates one resolved header map (D14/R14): names pass the
-// credential-header rules (token pattern + reserved/hop-by-hop blacklist,
-// vault.go reservedHeaderNames), values are non-empty strings within the
-// per-value cap, and the map stays within the entry cap.
+// decodeHeaderMap enforces the credential-header rules: token-pattern names
+// off the reserved/hop-by-hop blacklist, non-empty values within the caps.
 func decodeHeaderMap(raw json.RawMessage) (map[string]string, error) {
 	fields, err := strictJSONObject(raw)
 	if err != nil {
@@ -613,8 +578,8 @@ func decodeHeaderMap(raw json.RawMessage) (map[string]string, error) {
 	headers := make(map[string]string, len(fields))
 	seenNames := make(map[string]struct{}, len(fields))
 	for name, valueRaw := range fields {
-		// HTTP header names are case-insensitive: byte-different JSON keys
-		// naming one header are a contract violation, not two headers.
+		// Header names are case-insensitive; byte-different keys naming one
+		// header are one header, not two.
 		lowerName := strings.ToLower(name)
 		if _, duplicate := seenNames[lowerName]; duplicate {
 			return nil, resolverErrorf(ResolverInvalidResponse, "duplicate_header_name")
@@ -630,9 +595,7 @@ func decodeHeaderMap(raw json.RawMessage) (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		// D14 boundary: the envelope is untrusted input and these values are
-		// injected into outbound HTTP frames; reject anything that is not a
-		// legal HTTP field-value (control bytes incl. CR/LF/NUL/DEL).
+		// Values land in outbound HTTP frames; reject illegal field-values.
 		if !httpguts.ValidHeaderFieldValue(value) {
 			return nil, resolverErrorf(ResolverDenied, "denied_header_value")
 		}
@@ -641,9 +604,7 @@ func decodeHeaderMap(raw json.RawMessage) (map[string]string, error) {
 	return headers, nil
 }
 
-// decodeRedactionMap validates the resolver-provided incremental redactions
-// (R14): total values within the redaction cap, each value non-empty and
-// within the per-value cap.
+// decodeRedactionMap validates resolver-provided incremental redactions (R9).
 func decodeRedactionMap(raw json.RawMessage) (map[string][]string, error) {
 	fields, err := strictJSONObject(raw)
 	if err != nil {
@@ -679,8 +640,7 @@ func decodeNonEmptyString(raw json.RawMessage, tooLongReason string) (string, er
 		return "", resolverErrorf(ResolverInvalidResponse, "value_not_string")
 	}
 	if value == "" {
-		// A schema violation (the contract requires non-empty strings), not
-		// a limit exceedance.
+		// Schema violation, not a limit.
 		return "", resolverErrorf(ResolverInvalidResponse, "empty_value")
 	}
 	if len(value) > maxResolverValueBytes {
@@ -712,9 +672,8 @@ func decodeNonEmptyStringArray(raw json.RawMessage) ([]string, error) {
 	return values, nil
 }
 
-// strictJSONObject decodes exactly one JSON object with unique keys into
-// name → raw value. Duplicate keys, non-objects, or trailing bytes are
-// rejected.
+// strictJSONObject decodes one JSON object with unique keys; rejects
+// non-objects and trailing bytes.
 func strictJSONObject(data []byte) (map[string]json.RawMessage, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	token, err := decoder.Token()
@@ -755,8 +714,8 @@ func strictJSONObject(data []byte) (map[string]json.RawMessage, error) {
 	return fields, nil
 }
 
-// canonicalResolverRedactions orders redaction values the way the decision
-// snapshot expects: non-empty, deduped, ascending length then bytes.
+// canonicalResolverRedactions dedups and orders values by length then
+// bytes (decision-snapshot canonical form).
 func canonicalResolverRedactions(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	merged := make([]string, 0, len(values))

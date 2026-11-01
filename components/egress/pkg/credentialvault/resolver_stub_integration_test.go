@@ -37,10 +37,8 @@ import (
 )
 
 // Integration tests against the frozen OSEP-0025 contract stub
-// (tests/resolver/resolver.py, PR #2495). Every stub assertion is based on
-// the deterministic signature sha256(subject|credential|binding|authority|
-// path) or fixed status codes, never on wall-clock behavior beyond injected
-// delays.
+// (tests/resolver/resolver.py). Assertions key on the deterministic
+// sha256(subject|credential|binding|authority|path) signature, not wall-clock.
 
 const stubResolverReadyPrefix = "test resolver ready: "
 
@@ -74,9 +72,8 @@ type stubResolverProcess struct {
 	endpoint string
 }
 
-// startStubResolver launches one resolver.py server process and returns the
-// endpoint it printed on the ready line ("uds://<path>" or
-// "https://HOST:PORT").
+// startStubResolver launches one resolver.py process; returns the ready
+// line endpoint ("uds://<path>" or "https://HOST:PORT").
 func startStubResolver(t *testing.T, stubEnv []string, args ...string) *stubResolverProcess {
 	t.Helper()
 	script := stubResolverScript(t)
@@ -157,8 +154,8 @@ func requireStubHappyDecision(t *testing.T, decision *ResolverDecision) {
 		"authorization": {}, "x-test-signature": {}, "x-test-subject": {},
 	}, decision.Suppress)
 
-	// R9: the derived 7-variant set covers every resolved header value even
-	// when the resolver reports no redactions for them.
+	// R9: derived variants cover every header value even without resolver
+	// redactions.
 	for _, value := range decision.Headers {
 		for _, variant := range substitutionRedactionVariants(value) {
 			require.Contains(t, decision.Redactions, variant)
@@ -180,8 +177,7 @@ func TestStubIntegrationUDSHappyPath(t *testing.T) {
 }
 
 func TestStubIntegrationUDSHeaderlessFrame(t *testing.T) {
-	// The wire shape for a header-less request frame: nil must serialize as
-	// an empty JSON object (the stub answers null with 400 malformed_request).
+	// nil headers must serialize as {} — the stub 400s on null.
 	socketPath := filepath.Join(shortTempDir(t), "r.sock")
 	stub := startStubResolver(t, nil, "--uds", socketPath)
 
@@ -195,8 +191,7 @@ func TestStubIntegrationUDSHeaderlessFrame(t *testing.T) {
 }
 
 func TestStubIntegrationUDSIncompleteRedactions(t *testing.T) {
-	// The stub reports redactions for only one header; derivation stays
-	// authoritative (R9) and still covers every header value.
+	// Redactions reported for one header; derivation still covers all (R9).
 	socketPath := filepath.Join(shortTempDir(t), "r.sock")
 	stub := startStubResolver(t, nil, "--uds", socketPath, "--incomplete-redactions")
 
@@ -217,16 +212,14 @@ func stubHTTPSArgs(t *testing.T, port int) []string {
 }
 
 func TestStubIntegrationHTTPSAuthOriginTable(t *testing.T) {
-	// Pre-bind a port so both sides can be configured with the origin before
-	// the stub reads its auth table at startup.
+	// Pre-bind the port: the stub reads its auth table at startup.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := listener.Addr().(*net.TCPAddr).Port
 	require.NoError(t, listener.Close())
 	origin := fmt.Sprintf("https://127.0.0.1:%d", port)
 
-	// The same env table configures the stub's expected token and the
-	// client's origin-scoped credential (D5).
+	// One env table drives both the stub's expected token and the client.
 	authEntry := constants.EnvCredentialResolverAuth + "=" + origin + "=resolver-token-1"
 	stub := startStubResolver(t, []string{authEntry}, stubHTTPSArgs(t, port)...)
 	require.Equal(t, origin, stub.endpoint)
@@ -245,8 +238,7 @@ func TestStubIntegrationHTTPSAuthOriginTable(t *testing.T) {
 }
 
 func TestStubIntegrationHTTPSUnmatchedOriginGetsNoToken(t *testing.T) {
-	// The client only holds a token for a different origin; the stub expects
-	// one for its own origin and must answer 401 — proving no token leaked.
+	// The client holds only another origin's token; the stub must 401.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := listener.Addr().(*net.TCPAddr).Port

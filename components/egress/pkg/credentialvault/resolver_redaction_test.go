@@ -22,9 +22,7 @@ import (
 )
 
 func TestDeriveResolverDecisionVariantCompleteness(t *testing.T) {
-	// One value exercising every encoding family: spaces, plus signs,
-	// reserved URL characters, JSON-escaped quotes/newlines, non-ASCII, and
-	// an astral character (surrogate pair territory).
+	// One value exercising every encoding family incl. an astral char.
 	value := "a b+c/d?e=\"f\"&g\nh\U0001F600"
 	decision := deriveResolverDecision(map[string]string{"X-Handled": value}, nil)
 
@@ -37,9 +35,8 @@ func TestDeriveResolverDecisionVariantCompleteness(t *testing.T) {
 		require.Contains(t, decision.Redactions, variant)
 	}
 
-	// URL encoding appears in both percent-escape cases; form encoding in
-	// both plus/percent forms; JSON escaping in both raw-UTF-8 and
-	// ASCII-escape encodings.
+	// URL and form encoding in both percent-escape cases; JSON escaping in
+	// both raw-UTF-8 and ASCII-escape forms.
 	expected := []string{
 		value, // raw
 		"a%20b%2Bc%2Fd%3Fe%3D%22f%22%26g%0Ah%F0%9F%98%80", // URL, uppercase escapes, space as %20
@@ -50,8 +47,7 @@ func TestDeriveResolverDecisionVariantCompleteness(t *testing.T) {
 	for _, want := range expected {
 		require.Contains(t, decision.Redactions, want)
 	}
-	// JSON escape: quote, newline, and ampersand escaped, non-ASCII kept
-	// as UTF-8 (encoding/json default HTML escaping).
+	// JSON escape: encoding/json default escaping (incl. \u0026).
 	require.Contains(t, decision.Redactions, "a b+c/d?e=\\\"f\\\"\\u0026g\\nh\U0001F600")
 	// JSON ASCII escape: emoji as the UTF-16 surrogate pair.
 	require.Contains(t, decision.Redactions, "a b+c/d?e=\\\"f\\\"&g\\nh\\ud83d\\ude00")
@@ -81,8 +77,7 @@ func TestResolverRedactionsAreIncrementalR9(t *testing.T) {
 	require.NotContains(t, decision.Redactions, "")
 	require.Len(t, decision.Redactions, len(expected)+1)
 
-	// The resolver cannot shrink the set: with no redactions at all the
-	// derived variants remain.
+	// The resolver cannot shrink the derived set.
 	decision = deriveResolverDecision(map[string]string{"x-a": value}, nil)
 	require.Equal(t, expected, decision.Redactions)
 }

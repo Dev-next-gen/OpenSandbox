@@ -135,8 +135,7 @@ func TestParseResolverAuthEnv(t *testing.T) {
 		"=alpha",
 		"notaentry",
 		"https://resolver.internal:8443=alpha,https://resolver.internal:8443=beta",
-		// Path/query-qualified origins would silently broaden the token
-		// scope after normalization — rejected, not accepted.
+		// Path-qualified origins would silently broaden the token scope.
 		"https://resolver.internal/base=alpha",
 		"https://resolver.internal?zone=1=alpha",
 		"https://resolver.internal:8443/#frag=alpha",
@@ -243,8 +242,7 @@ func TestDecodeResolveResponseStrictness(t *testing.T) {
 		requireKind(t, err, ResolverInvalidResponse)
 	}
 
-	// Duplicate object keys are rejected, not last-wins — including
-	// case-insensitive header names, which HTTP treats as one header.
+	// Duplicate keys are rejected, not last-wins — case-insensitively too.
 	_, err := decodeResolveResponse([]byte(`{"headers":{"x-a":"1"},"headers":{"x-a":"2"}}`))
 	requireKind(t, err, ResolverInvalidResponse)
 	_, err = decodeResolveResponse([]byte(`{"headers":{"x-a":"1","x-a":"2"}}`))
@@ -288,8 +286,7 @@ func TestResolveUnavailableWhenSocketMissing(t *testing.T) {
 	requireKind(t, err, ResolverUnavailable)
 }
 
-// startEnvelopeServer runs an HTTPS test resolver answering every POST with
-// status/body. It returns the endpoint URI and the test TLS configuration.
+// startEnvelopeServer runs an HTTPS test resolver returning status/body.
 func startEnvelopeServer(t *testing.T, status int, body string, captured *capturedRequest) (string, *tls.Config) {
 	t.Helper()
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -374,9 +371,7 @@ func TestHTTPSFrameAndHappyPath(t *testing.T) {
 }
 
 func TestResolveHeaderlessFrameWireShape(t *testing.T) {
-	// A nil Go header map must serialize as an empty JSON object: the frozen
-	// contract requires request.headers to be an object, and null would be
-	// rejected by a contract-compliant resolver as malformed_request.
+	// nil must serialize as {} — a contract-compliant resolver rejects null.
 	var captured capturedRequest
 	endpoint, tlsConfig := startEnvelopeServer(t, http.StatusOK, `{"headers":{}}`, &captured)
 	client, err := NewResolverClient(ResolverClientOptions{Endpoint: endpoint, Timeout: time.Second, MaxConcurrency: 1, TLSClientConfig: tlsConfig})
@@ -483,8 +478,7 @@ func TestResolverDeniedLimits(t *testing.T) {
 }
 
 func TestResolverDeniedResponseTooLarge(t *testing.T) {
-	// A 200 with a body over the 64KiB envelope cap is a per-request denial;
-	// the client must also stop reading promptly.
+	// A 200 body over the 64KiB cap is a per-request denial.
 	large := `{"headers":{"x-a":"` + strings.Repeat("v", maxResolverResponseBytes) + `"}}`
 	endpoint, tlsConfig := startEnvelopeServer(t, http.StatusOK, large, nil)
 	client, err := NewResolverClient(ResolverClientOptions{Endpoint: endpoint, Timeout: 5 * time.Second, MaxConcurrency: 1, TLSClientConfig: tlsConfig})
@@ -623,8 +617,8 @@ func TestResolverMaxConcurrencyBounded(t *testing.T) {
 }
 
 func TestResolverClientInterfaceContract(t *testing.T) {
-	// The decision shape is the interception contract: headers as returned,
-	// lowercase suppress names, canonically ordered redactions.
+	// Decision shape: headers as returned, lowercase suppress, canonical
+	// redactions.
 	envelope := `{"headers":{"X-Signature":"sig","X-Token":"tok"},"redactions":{"X-Signature":["sig"]}}`
 	endpoint, tlsConfig := startEnvelopeServer(t, http.StatusOK, envelope, nil)
 	client, err := NewResolverClient(ResolverClientOptions{Endpoint: endpoint, Timeout: time.Second, MaxConcurrency: 1, TLSClientConfig: tlsConfig})
