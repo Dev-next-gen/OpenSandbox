@@ -32,6 +32,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 )
 
@@ -343,6 +345,12 @@ func normalizeResolverOriginString(origin string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// D5 key format is exactly scheme://host:port — an operator writing a
+	// path/query-qualified origin would silently broaden the token's scope
+	// after normalization, so reject rather than accept.
+	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return "", errors.New("origin must be scheme://host:port")
+	}
 	return normalizeResolverOrigin(parsed)
 }
 
@@ -461,6 +469,10 @@ func (c *resolverClient) Resolve(ctx context.Context, input ResolveInput) (*Reso
 
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxResolverResponseBytes+1))
 	if err != nil {
+		// A trickling body past the deadline is a timeout, not unavailability.
+		if callCtx.Err() != nil {
+			return nil, &ResolverError{Kind: ResolverTimeout, err: callCtx.Err()}
+		}
 		return nil, &ResolverError{Kind: ResolverUnavailable, err: err}
 	}
 	if len(data) > maxResolverResponseBytes {
@@ -494,6 +506,13 @@ func marshalResolveInput(input ResolveInput) ([]byte, error) {
 			return nil, resolverErrorf(ResolverInvalidRequest, "request_headers_must_be_non_empty_strings")
 		}
 	}
+	requestHeaders := input.Request.Headers
+	if requestHeaders == nil {
+		// D15 wire shape: the frozen contract requires request.headers to be
+		// a JSON object; a nil Go map would serialize as null and be
+		// rejected by a contract-compliant resolver.
+		requestHeaders = map[string]string{}
+	}
 	document := resolveRequestDocument{
 		Subject:    input.Subject,
 		Credential: input.Credential,
@@ -507,7 +526,7 @@ func marshalResolveInput(input ResolveInput) ([]byte, error) {
 			Method:  input.Request.Method,
 			Host:    input.Request.Host,
 			Path:    input.Request.Path,
-			Headers: input.Request.Headers,
+			Headers: requestHeaders,
 		},
 	}
 	encoded, err := json.Marshal(document)
@@ -592,7 +611,15 @@ func decodeHeaderMap(raw json.RawMessage) (map[string]string, error) {
 		return nil, resolverErrorf(ResolverDenied, "too_many_headers")
 	}
 	headers := make(map[string]string, len(fields))
+	seenNames := make(map[string]struct{}, len(fields))
 	for name, valueRaw := range fields {
+		// HTTP header names are case-insensitive: byte-different JSON keys
+		// naming one header are a contract violation, not two headers.
+		lowerName := strings.ToLower(name)
+		if _, duplicate := seenNames[lowerName]; duplicate {
+			return nil, resolverErrorf(ResolverInvalidResponse, "duplicate_header_name")
+		}
+		seenNames[lowerName] = struct{}{}
 		if len(name) > maxResolverValueBytes {
 			return nil, resolverErrorf(ResolverDenied, "header_name_too_long")
 		}
@@ -602,6 +629,12 @@ func decodeHeaderMap(raw json.RawMessage) (map[string]string, error) {
 		value, err := decodeNonEmptyString(valueRaw, "header_value_too_long")
 		if err != nil {
 			return nil, err
+		}
+		// D14 boundary: the envelope is untrusted input and these values are
+		// injected into outbound HTTP frames; reject anything that is not a
+		// legal HTTP field-value (control bytes incl. CR/LF/NUL/DEL).
+		if !httpguts.ValidHeaderFieldValue(value) {
+			return nil, resolverErrorf(ResolverDenied, "denied_header_value")
 		}
 		headers[name] = value
 	}
@@ -646,7 +679,9 @@ func decodeNonEmptyString(raw json.RawMessage, tooLongReason string) (string, er
 		return "", resolverErrorf(ResolverInvalidResponse, "value_not_string")
 	}
 	if value == "" {
-		return "", resolverErrorf(ResolverDenied, "empty_value")
+		// A schema violation (the contract requires non-empty strings), not
+		// a limit exceedance.
+		return "", resolverErrorf(ResolverInvalidResponse, "empty_value")
 	}
 	if len(value) > maxResolverValueBytes {
 		return "", resolverErrorf(ResolverDenied, tooLongReason)

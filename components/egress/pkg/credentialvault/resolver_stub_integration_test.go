@@ -179,6 +179,21 @@ func TestStubIntegrationUDSHappyPath(t *testing.T) {
 	requireStubHappyDecision(t, decision)
 }
 
+func TestStubIntegrationUDSHeaderlessFrame(t *testing.T) {
+	// The wire shape for a header-less request frame: nil must serialize as
+	// an empty JSON object (the stub answers null with 400 malformed_request).
+	socketPath := filepath.Join(shortTempDir(t), "r.sock")
+	stub := startStubResolver(t, nil, "--uds", socketPath)
+
+	client, err := NewResolverClient(ResolverClientOptions{Endpoint: stub.endpoint, Timeout: 5 * time.Second, MaxConcurrency: 4})
+	require.NoError(t, err)
+	input := resolverTestInput()
+	input.Request.Headers = nil
+	decision, err := client.Resolve(context.Background(), input)
+	require.NoError(t, err)
+	requireStubHappyDecision(t, decision)
+}
+
 func TestStubIntegrationUDSIncompleteRedactions(t *testing.T) {
 	// The stub reports redactions for only one header; derivation stays
 	// authoritative (R9) and still covers every header value.

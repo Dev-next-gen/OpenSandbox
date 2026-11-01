@@ -135,6 +135,12 @@ func TestParseResolverAuthEnv(t *testing.T) {
 		"=alpha",
 		"notaentry",
 		"https://resolver.internal:8443=alpha,https://resolver.internal:8443=beta",
+		// Path/query-qualified origins would silently broaden the token
+		// scope after normalization — rejected, not accepted.
+		"https://resolver.internal/base=alpha",
+		"https://resolver.internal?zone=1=alpha",
+		"https://resolver.internal:8443/#frag=alpha",
+		"https://user@resolver.internal:8443=alpha",
 	} {
 		_, err = ParseResolverAuthEnv(bad)
 		require.Error(t, err, "auth table %q must be rejected", bad)
@@ -205,7 +211,8 @@ func TestDecodeResolveResponseStrictness(t *testing.T) {
 		{"header_value_too_long", `{"headers":{"x-a":"` + strings.Repeat("v", 9000) + `"}}`},
 		{"denied_header_name", `{"headers":{"host":"evil"}}`},
 		{"denied_header_name", `{"headers":{"bad name":"v"}}`},
-		{"empty_value", `{"headers":{"x-a":""}}`},
+		{"denied_header_value", `{"headers":{"x-a":"v\nX-Injected: 1"}}`},
+		{"denied_header_value", `{"headers":{"x-a":"v\u0000"}}`},
 		{"too_many_redactions", `{"headers":{"x-a":"v"},"redactions":{"x-a":[` + manyStrings(65) + `]}}`},
 		{"redaction_value_too_long", `{"headers":{"x-a":"v"},"redactions":{"x-a":["` + strings.Repeat("v", 9000) + `"]}}`},
 	}
@@ -225,6 +232,7 @@ func TestDecodeResolveResponseStrictness(t *testing.T) {
 		`{"headers":[]}`,
 		`{"headers":{"x-a":null}}`,
 		`{"headers":{"x-a":1}}`,
+		`{"headers":{"x-a":""}}`,
 		`{"headers":{"x-a":"v"},"redactions":[]}`,
 		`{"headers":{"x-a":"v"},"redactions":{"x-a":[]}}`,
 		`{"headers":{"x-a":"v"},"redactions":{"x-a":null}}`,
@@ -235,10 +243,13 @@ func TestDecodeResolveResponseStrictness(t *testing.T) {
 		requireKind(t, err, ResolverInvalidResponse)
 	}
 
-	// Duplicate object keys are rejected, not last-wins.
+	// Duplicate object keys are rejected, not last-wins — including
+	// case-insensitive header names, which HTTP treats as one header.
 	_, err := decodeResolveResponse([]byte(`{"headers":{"x-a":"1"},"headers":{"x-a":"2"}}`))
 	requireKind(t, err, ResolverInvalidResponse)
 	_, err = decodeResolveResponse([]byte(`{"headers":{"x-a":"1","x-a":"2"}}`))
+	requireKind(t, err, ResolverInvalidResponse)
+	_, err = decodeResolveResponse([]byte(`{"headers":{"X-A":"1","x-a":"2"}}`))
 	requireKind(t, err, ResolverInvalidResponse)
 
 	document, err := decodeResolveResponse([]byte(`{"headers":{"X-A":"1","x-b":"2"},"redactions":{"X-A":["1"]}}`))
@@ -362,6 +373,25 @@ func TestHTTPSFrameAndHappyPath(t *testing.T) {
 	require.Contains(t, decision.Redactions, "abc")
 }
 
+func TestResolveHeaderlessFrameWireShape(t *testing.T) {
+	// A nil Go header map must serialize as an empty JSON object: the frozen
+	// contract requires request.headers to be an object, and null would be
+	// rejected by a contract-compliant resolver as malformed_request.
+	var captured capturedRequest
+	endpoint, tlsConfig := startEnvelopeServer(t, http.StatusOK, `{"headers":{}}`, &captured)
+	client, err := NewResolverClient(ResolverClientOptions{Endpoint: endpoint, Timeout: time.Second, MaxConcurrency: 1, TLSClientConfig: tlsConfig})
+	require.NoError(t, err)
+	input := resolverTestInput()
+	input.Request.Headers = nil
+	_, err = client.Resolve(context.Background(), input)
+	require.NoError(t, err)
+	frame := captured.snapshot()
+	require.NotNil(t, frame.body)
+	requestFrame, ok := frame.body["request"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, map[string]any{}, requestFrame["headers"])
+}
+
 func TestUDSFrameAndNoAuthorization(t *testing.T) {
 	dir, err := os.MkdirTemp("", "osbr")
 	require.NoError(t, err)
@@ -436,7 +466,7 @@ func TestResolverDeniedLimits(t *testing.T) {
 		{"reservedHeaderName", `{"headers":{"proxy-authorization":"v"}}`, "denied_header_name"},
 		{"reservedHeaderNameHost", `{"headers":{"Host":"evil"}}`, "denied_header_name"},
 		{"invalidHeaderNameChars", `{"headers":{"bad name":"v"}}`, "denied_header_name"},
-		{"emptyHeaderValue", `{"headers":{"x-a":""}}`, "empty_value"},
+		{"headerValueControlBytes", `{"headers":{"x-a":"v\nX-Injected: 1"}}`, "denied_header_value"},
 		{"tooManyRedactions", `{"headers":{"x-a":"v"},"redactions":{"x-a":[` + manyStrings(maxResolverRedactionCount+1) + `]}}`, "too_many_redactions"},
 		{"redactionValueTooLong", `{"headers":{"x-a":"v"},"redactions":{"x-a":["` + strings.Repeat("v", maxResolverValueBytes+1) + `"]}}`, "redaction_value_too_long"},
 	}
