@@ -259,15 +259,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return False
 
     def _json_body(self) -> dict[str, Any]:
+        # Consume the body per its declared length before rejecting the
+        # request: replying and closing with the body unread races the
+        # client's send on Unix sockets (immediate EPIPE).
         if self.headers.get_all("Transfer-Encoding", []):
             raise _BadRequest
-        types = self.headers.get_all("Content-Type", [])
         lengths = self.headers.get_all("Content-Length", [])
-        if (
-            types != ["application/json"]
-            or len(lengths) != 1
-            or not lengths[0].isdigit()
-        ):
+        if len(lengths) != 1 or not lengths[0].isdigit():
             raise _BadRequest
         length = int(lengths[0])
         if length > MAX_REQUEST_BYTES:
@@ -275,6 +273,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             raise _TooLarge
         raw = self.rfile.read(length)
         if len(raw) != length:
+            raise _BadRequest
+        if self.headers.get_all("Content-Type", []) != ["application/json"]:
             raise _BadRequest
         try:
             value = json.loads(
