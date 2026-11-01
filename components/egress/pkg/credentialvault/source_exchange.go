@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -70,8 +71,14 @@ func validateResolverEndpoint(endpoint string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("exchange credential endpoint %q is not a valid https URL", endpoint)
 		}
-		if parsed.Host == "" || parsed.User != nil {
+		if parsed.Hostname() == "" || parsed.User != nil {
 			return "", fmt.Errorf("exchange credential endpoint %q must address https://host[:port]", endpoint)
+		}
+		if port := parsed.Port(); port != "" {
+			value, err := strconv.Atoi(port)
+			if err != nil || value < 1 || value > 65535 {
+				return "", fmt.Errorf("exchange credential endpoint %q has an invalid port", endpoint)
+			}
 		}
 		if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
 			return "", fmt.Errorf("exchange credential endpoint %q must not carry a query or fragment", endpoint)
