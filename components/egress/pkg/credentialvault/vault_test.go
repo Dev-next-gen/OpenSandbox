@@ -669,6 +669,51 @@ func TestCredentialVaultTypelessExchangeAuthSanitizesAndRendersMarker(t *testing
 	}`, string(mustMarshal(snapshot)))
 }
 
+func TestCredentialVaultExchangeMarkerSnapshotSurvivesPrepareCommitClone(t *testing.T) {
+	// The relay write path serves the snapshot pinned by CommitCandidate —
+	// a clone. Degrading the marker's empty arrays to null would fail the
+	// addon parser closed; passthrough pins the pre-existing null bytes.
+	store := testResolverReadyStore()
+	request := testExchangeVaultRequest()
+	request.Bindings = append(request.Bindings, Binding{
+		Name:  "passthrough-api",
+		Match: Match{Hosts: []string{"plain.internal.example.com"}, Methods: []string{"GET"}, Paths: []string{"/other/*"}},
+		Auth:  Auth{Type: "passthrough"},
+	})
+	pol := testCredentialPolicy(t, `{"defaultAction":"deny","egress":[
+		{"action":"allow","target":"api.internal.example.com"},
+		{"action":"allow","target":"plain.internal.example.com"}
+	]}`)
+	candidate, err := store.PrepareCreate(request, pol)
+	require.NoError(t, err)
+	_, err = candidate.ActiveSnapshot(context.Background())
+	require.NoError(t, err)
+	_, err = store.CommitCandidate(candidate)
+	require.NoError(t, err)
+
+	served, err := store.ActiveSnapshot()
+	require.NoError(t, err)
+	encoded := string(mustMarshal(served))
+	require.Contains(t, encoded, `"headers":[],"substitutions":[],"exchange":{"credential":"spi-signer"}`)
+	require.Contains(t, encoded, `"headers":null`)
+	require.NotContains(t, encoded, `"exchange":null`)
+
+	bindings := map[string]ActiveBinding{}
+	for _, binding := range served.Bindings {
+		bindings[binding.Name] = binding
+	}
+	require.NotNil(t, bindings["internal-api"].Headers)
+	require.Empty(t, bindings["internal-api"].Headers)
+	require.NotNil(t, bindings["internal-api"].Substitutions)
+	require.Empty(t, *bindings["internal-api"].Substitutions)
+
+	// The conditional-lookup path serves the same pinned clone.
+	conditional, _, changed, err := store.ActiveSnapshotIfChanged(context.Background(), "")
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, served, conditional)
+}
+
 func TestCredentialVaultTypelessAuthRejectsExtraFields(t *testing.T) {
 	base := testExchangeVaultRequest()
 	tests := []struct {
@@ -834,9 +879,7 @@ func TestCredentialVaultLiveRevisionRuntimeRejectsExchange(t *testing.T) {
 }
 
 func TestCredentialVaultExchangeReloadRequiresNoResolverListener(t *testing.T) {
-	// Reload runs factory validation and the capability gate only — it must
-	// never dial the resolver, so it succeeds without anything listening on
-	// the endpoint socket.
+	// Reload runs factory validation and gates only — never dials the resolver.
 	store := testResolverReadyStore()
 	require.NoError(t, store.Reload(4, testExchangeVaultRequest(), testExchangePolicy(t)))
 	snapshot, err := store.ActiveSnapshot()

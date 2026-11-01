@@ -23,11 +23,9 @@ import (
 	"strings"
 )
 
-// exchangeSource is a credential with no local material: header sets are
-// resolved per request by an external header-resolver service (OSEP-0025).
-// Resolve is deliberately offline — exchange credentials are never rendered
-// into static snapshots; they surface only as binding markers and are
-// resolved on the per-request path.
+// exchangeSource holds no local material: header sets resolve per request
+// from the endpoint's resolver. Resolve fails closed — exchange credentials
+// surface only as snapshot markers, never rendered values.
 type exchangeSource struct {
 	endpoint string
 }
@@ -41,9 +39,7 @@ func (s *exchangeSource) Resolve(_ context.Context) (string, error) {
 // exchangeSourceFactory creates an exchangeSource from the raw JSON "source"
 // object. Expected shape: {"type": "exchange", "endpoint": "<uri>"}.
 // Unknown fields are rejected to match the OpenAPI additionalProperties: false
-// contract. Supported endpoint forms are unix:///absolute/path (HTTP over a
-// Unix domain socket) and https://host[:port] (optionally with a path
-// prefix); anything else is rejected.
+// contract.
 func exchangeSourceFactory(raw json.RawMessage) (CredentialSource, error) {
 	var src struct {
 		Type     string `json:"type"`
@@ -76,6 +72,9 @@ func validateResolverEndpoint(endpoint string) (string, error) {
 		}
 		if parsed.Host == "" || parsed.User != nil {
 			return "", fmt.Errorf("exchange credential endpoint %q must address https://host[:port]", endpoint)
+		}
+		if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
+			return "", fmt.Errorf("exchange credential endpoint %q must not carry a query or fragment", endpoint)
 		}
 		return endpoint, nil
 	default:

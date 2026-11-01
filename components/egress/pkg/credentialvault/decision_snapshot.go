@@ -138,16 +138,17 @@ func validRenderedBinding(binding *ActiveBinding, redactions map[string]struct{}
 	}
 	binding.Headers = append([]InjectionHeader{}, binding.Headers...)
 	if binding.Exchange != nil {
-		// OSEP-0025 marker binding: a credential-only reference with no
-		// rendered material, so no redaction coverage is required. The
-		// canonical encoding carries explicit empty headers/substitutions
-		// arrays; readers without exchange support reject the unknown key
-		// (version-skew fail closed).
+		// Marker binding: no rendered material, so no redaction coverage.
+		// Canonical form keeps explicit empty arrays; the marker plus any
+		// rendered content is non-canonical and rejected.
 		credential := binding.Exchange.Credential
 		if credential == "" || credential != strings.TrimSpace(credential) {
 			return false
 		}
 		if len(binding.Headers) != 0 {
+			return false
+		}
+		if binding.Substitutions != nil && len(*binding.Substitutions) != 0 {
 			return false
 		}
 		empty := []InjectionSubstitution{}

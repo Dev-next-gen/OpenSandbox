@@ -45,6 +45,8 @@ func TestExchangeSourceFactoryRejects(t *testing.T) {
 		{"empty endpoint", `{"type":"exchange","endpoint":""}`},
 		{"http scheme", `{"type":"exchange","endpoint":"http://resolver.internal"}`},
 		{"bare host", `{"type":"exchange","endpoint":"resolver.internal:8443"}`},
+		{"query string", `{"type":"exchange","endpoint":"https://resolver.internal/prefix?debug=1"}`},
+		{"fragment", `{"type":"exchange","endpoint":"https://resolver.internal/prefix#section"}`},
 		{"unix relative path", `{"type":"exchange","endpoint":"unix://spi.sock"}`},
 		{"unix empty path", `{"type":"exchange","endpoint":"unix:///"}`},
 		{"unknown field", `{"type":"exchange","endpoint":"unix:///run/spi.sock","value":"secret"}`},

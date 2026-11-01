@@ -240,6 +240,9 @@ func TestMarshalDecisionSnapshotRejectsNonCanonicalExchangeMarkers(t *testing.T)
 		{"blank credential", func(b *ActiveBinding) { b.Exchange.Credential = "" }},
 		{"padded credential", func(b *ActiveBinding) { b.Exchange.Credential = " spi-signer " }},
 		{"rendered header", func(b *ActiveBinding) { b.Headers = []InjectionHeader{{Name: "Authorization", Value: "never-log-me"}} }},
+		{"rendered substitution", func(b *ActiveBinding) {
+			b.Substitutions = &[]InjectionSubstitution{{Placeholder: "__t__", Value: "never-log-me", In: []string{"header"}}}
+		}},
 		{"nil exchange credential", func(b *ActiveBinding) { b.Exchange = &ExchangeRef{} }},
 	}
 	for _, tc := range tests {

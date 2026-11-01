@@ -396,9 +396,7 @@ func renderActiveSnapshot(
 	for _, name := range names {
 		binding := bindings[name]
 		if binding.Auth.Type == "" {
-			// Typeless exchange binding: marker-only. No credential material
-			// is rendered locally and no resolve network call happens on this
-			// path — header sets are resolved per request by the resolver.
+			// Typeless exchange binding: marker-only, no rendering, no network.
 			snapshot.Bindings = append(snapshot.Bindings, ActiveBinding{
 				Name:          binding.Name,
 				Match:         binding.Match,
@@ -454,7 +452,7 @@ func cloneActiveSnapshot(snapshot ActiveSnapshot) ActiveSnapshot {
 		rendered := ActiveBinding{
 			Name:    binding.Name,
 			Match:   cloneMatch(binding.Match),
-			Headers: append([]InjectionHeader(nil), binding.Headers...),
+			Headers: cloneInjectionHeaders(binding.Headers),
 		}
 		if binding.Substitutions != nil {
 			subs := make([]InjectionSubstitution, len(*binding.Substitutions))
@@ -473,6 +471,16 @@ func cloneActiveSnapshot(snapshot ActiveSnapshot) ActiveSnapshot {
 		clone.Bindings[i] = rendered
 	}
 	return clone
+}
+
+// cloneInjectionHeaders preserves nil-ness: passthrough bindings render null
+// headers while exchange markers carry an explicit empty array — degrading
+// the empty array to null would fail the addon parser closed.
+func cloneInjectionHeaders(headers []InjectionHeader) []InjectionHeader {
+	if headers == nil {
+		return nil
+	}
+	return append(make([]InjectionHeader, 0, len(headers)), headers...)
 }
 
 func cloneMatch(match Match) Match {

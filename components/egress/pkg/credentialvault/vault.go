@@ -235,10 +235,9 @@ type ActiveSnapshot struct {
 	Redactions []string        `json:"redactions,omitempty"`
 }
 
-// ExchangeRef marks an exchange-resolved binding in snapshots: header sets
-// are not materialized locally, only the credential that the per-request
-// resolve path must consult. The referenced credential is always
-// exchange-sourced (enforced by validateAuthSourceCrossLock).
+// ExchangeRef marks an exchange-resolved binding in snapshots: no material
+// is rendered locally, only the credential the per-request resolve path
+// consults (always exchange-sourced, per the cross-lock).
 type ExchangeRef struct {
 	Credential string `json:"credential"`
 }
@@ -270,25 +269,20 @@ func NewLiveStore(gate *mitmproxy.HealthGate, requireToken func() bool, config m
 	return store
 }
 
-// ResolverConfig reports whether the credential resolver operator
-// configuration (OSEP-0025 D13) is ready: a resolve timeout is configured and
-// the endpoint-scoped auth table parsed successfully. The zero value is not
-// ready — vaults referencing exchange credentials fail closed until the
-// transport layer injects its parsed configuration.
+// ResolverConfig reports whether the resolver operator configuration is
+// ready (D13): resolve timeout configured and the endpoint auth table parsed.
+// The zero value is not ready — exchange vaults fail closed until injected.
 type ResolverConfig struct {
 	TimeoutConfigured bool
 	AuthTableParsed   bool
 }
 
-// Ready reports whether vaults referencing exchange credentials may be
-// admitted.
 func (c ResolverConfig) Ready() bool {
 	return c.TimeoutConfigured && c.AuthTableParsed
 }
 
-// SetResolverConfig installs the resolver operator-config readiness used by
-// the exchange capability gate. Callers must invoke it before serving vault
-// mutations.
+// SetResolverConfig installs the exchange capability gate's readiness. Call
+// before serving vault mutations.
 func (v *Store) SetResolverConfig(config ResolverConfig) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -551,11 +545,9 @@ func (v *Store) validateCandidate(credentials map[string]record, bindings map[st
 	return nil
 }
 
-// validateExchangeAdmission is the exchange fail-closed gate: a vault that
-// carries exchange-sourced credentials is admitted only by stores with the
-// capability to serve the per-request resolve path. The live revision runtime
-// never supports exchange; ordinary stores require the resolver operator
-// configuration (D13). Inline-only vaults are unaffected.
+// validateExchangeAdmission fails closed on exchange-sourced credentials:
+// the live revision runtime never supports them; other stores require the
+// resolver operator configuration (D13). Inline-only vaults are unaffected.
 func (v *Store) validateExchangeAdmission(credentials map[string]record) error {
 	hasExchange := false
 	for _, credential := range credentials {
@@ -760,9 +752,8 @@ func normalizeAuth(a *Auth) error {
 			return fmt.Errorf("passthrough auth does not accept headers")
 		}
 	case "":
-		// Typeless: the exchange-only reference form. The referenced
-		// credential must be exchange-sourced (cross-lock) and nothing else
-		// may ride along — header sets resolve per request, never locally.
+		// Typeless: the exchange-only reference form; cross-lock enforces
+		// the exchange source. Headers resolve per request, never locally.
 		a.Credential = strings.TrimSpace(a.Credential)
 		if a.Credential == "" {
 			return fmt.Errorf("typeless auth requires credential")
@@ -802,13 +793,10 @@ func validateBindingCredentialRefs(b Binding, credentials map[string]record) err
 	return nil
 }
 
-// validateAuthSourceCrossLock pins the OSEP-0025 reference discipline: static
-// auth types render locally and must never consume exchange-sourced
-// credentials, while the typeless exchange form exists only for them.
-// Substitution values always render locally, so they reject exchange
-// credentials for every auth type. passthrough references no auth credential
-// and is otherwise unrestricted. Custom (non-exchange) source types keep
-// working with static auth.
+// validateAuthSourceCrossLock pins the exchange reference discipline: static
+// auth types and substitutions render locally and reject exchange-sourced
+// credentials; the typeless form accepts only exchange-sourced ones.
+// passthrough references no auth credential.
 func validateAuthSourceCrossLock(b Binding, credentials map[string]record) error {
 	for _, name := range authCredentialRefs(b.Auth) {
 		rec, ok := credentials[name]
@@ -913,10 +901,8 @@ func renderInjectionHeaders(ctx context.Context, auth Auth, credentials map[stri
 		}
 	case "passthrough":
 	case "":
-		// Typeless bindings reference exchange credentials and are rendered
-		// as snapshot markers only; their header sets come from the
-		// per-request resolve path. Defensive: renderActiveSnapshot never
-		// routes them here.
+		// Typeless bindings render as snapshot markers only; this branch is
+		// defensive — renderActiveSnapshot never routes them here.
 		return nil, nil, fmt.Errorf("typeless exchange auth cannot be rendered as static injection headers")
 	default:
 		return nil, nil, fmt.Errorf("unsupported auth type %q", auth.Type)
