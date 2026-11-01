@@ -254,6 +254,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             supplied = values[0] if len(values) == 1 else ""
             if hmac.compare_digest(supplied, "Bearer " + expected):
                 return True
+        self._drain_request()
         self._reply(401, {"error": "unauthorized"})
         return False
 
@@ -295,10 +296,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 break
             remaining -= len(chunk)
 
+    def _drain_request(self) -> None:
+        # Early replies must consume the request body first: replying and
+        # closing with the body unread races the client's send, and a Unix
+        # socket raises EPIPE the moment the peer has closed.
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) == 1 and lengths[0].isdigit():
+            self._drain(int(lengths[0]))
+
     def do_POST(self) -> None:
         if self.server.transport == "https" and not self._authenticate():
             return
         if self.path != "/resolve":
+            self._drain_request()
             self._reply(404, {"error": "not_found"})
             return
         options = self.server.options
@@ -306,9 +316,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             time.sleep(options.delay / 1000.0)
         if options.fail_once:
             options.fail_once = False
+            self._drain_request()
             self._reply(503, {"error": "resolution_refused"})
             return
         if options.fail_rate > 0 and random.random() < options.fail_rate:
+            self._drain_request()
             self._reply(503, {"error": "resolution_refused"})
             return
         try:
@@ -326,11 +338,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.server.transport == "https" and not self._authenticate():
             return
+        self._drain_request()
         self._reply(405, {"error": "method_not_allowed"})
 
     def _unsupported(self) -> None:
         if self.server.transport == "https" and not self._authenticate():
             return
+        self._drain_request()
         self._reply(405, {"error": "method_not_allowed"})
 
     do_CONNECT = do_DELETE = do_HEAD = do_OPTIONS = do_PATCH = do_PUT = do_TRACE = (
